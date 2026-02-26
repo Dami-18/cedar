@@ -30,6 +30,7 @@ extern crate lalrpop_util;
 pub mod ast;
 pub mod authorizer;
 mod from_normalized_str;
+pub mod poltree; // poltree module
 pub use from_normalized_str::*;
 pub mod entities;
 #[macro_use]
