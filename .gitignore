@@ -28,3 +28,7 @@ Cargo.lock
 
 # Auto-generated integration tests can be placed here but should not be committed
 cedar-integration-tests
+
+# Ignore stored policy and entities 
+entities.json
+policy.cedar
