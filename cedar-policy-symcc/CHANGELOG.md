@@ -10,7 +10,19 @@ Cedar Language Version: TBD
 
 ### Added
 
-- `Display` impl for `Env`
+- `Display` impl for `Env` (#2182)
+
+### Changed
+
+- Refactored `Solver` trait to include `check_sat_with_model()` instead of `get_model()`,
+to make the API easier to use with fewer implicit ordering constraints (#2190)
+- Added `enable_models()` as a required method for the `Solver` trait, to allow
+some implementors of `Solver` to perform other initialization/configuration as
+required when models are being enabled (#2192)
+
+### Fixed
+
+- Fixed bug in `Term::interpret` caused by missing `bvsrem` case (#2185)
 
 ## [0.3.0] - 2026-02-17
 Cedar Language Version: 4.4

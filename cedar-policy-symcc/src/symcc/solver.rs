@@ -51,6 +51,20 @@ pub enum Decision {
     Unknown,
 }
 
+/// Satisfiability decision from the SMT solver, with a model in the SAT case.
+#[derive(Clone, Debug, PartialEq, Eq, Ord, PartialOrd)]
+pub enum DecisionWithModel {
+    /// Sat
+    Sat {
+        /// Raw model from the solver
+        model: String,
+    },
+    /// Unsat
+    Unsat,
+    /// Unknown
+    Unknown,
+}
+
 /// Errors when interacting with a [`Solver`] instance.
 /// Corresponds to various errors in the Lean version at `Cedar.SymCC.Solver`
 #[derive(Debug, Diagnostic, Error)]
@@ -82,7 +96,41 @@ pub trait Solver {
     /// the trait `SmtLibScript` for free, as long as the `SmtLibScript` trait
     /// is brought into scope.
     fn smtlib_input(&mut self) -> &mut (dyn tokio::io::AsyncWrite + Unpin + Send);
-    /// Execute the query that has been written via `script()`, returning the `Decision`.
+
+    /// Enable models for the current solver query.
+    ///
+    /// This function is responsible for adding
+    /// `SmtLibScript::set_option("produce-models", "true")`.
+    /// It also may perform other functions depending on the `Solver`
+    /// implementation.
+    ///
+    /// This function _must_ be called before `check_sat_with_model()`, and in
+    /// fact, before writing anything to `smtlib_input()` prior to a
+    /// `check_sat_with_model()` (except optionally a `.reset()`).
+    ///
+    /// This signature could be written
+    /// `async fn enable_models(&mut self) -> Result<()>;`
+    /// but that would not allow us to include the `Send` bound we need.
+    /// What you see here is basically a desugaring of the above, plus the
+    /// `Send` bound. See <https://blog.rust-lang.org/2023/12/21/async-fn-rpit-in-traits/#async-fn-in-public-traits>
+    ///
+    /// Note that implementors of this trait, like `LocalSolver` and
+    /// `WriterSolver` below, can still use the `async fn` syntax sugar to
+    /// implement this.
+    fn enable_models(&mut self) -> impl Future<Output = Result<()>> + Send;
+    // minimal compliant implementation: (requires `Self: Send` so can't actually
+    // be a default implementation, but left here in comments)
+    /*
+    async fn enable_models(&mut self) -> Result<()> {
+        self.smtlib_input()
+            .set_option("produce-models", "true")
+            .await
+            .map_err(Into::into)
+    }
+    */
+
+    /// Execute the query that has been written via `smtlib_input()`, returning
+    /// the `Decision`.
     ///
     /// This function is also responsible for adding `SmtLibScript::check_sat()`.
     ///
@@ -96,8 +144,23 @@ pub trait Solver {
     /// `WriterSolver` below, can still use the `async fn` syntax sugar to
     /// implement this.
     fn check_sat(&mut self) -> impl Future<Output = Result<Decision>> + Send;
-    /// Call `(get-model)` and return the SMT model as a string.
-    fn get_model(&mut self) -> impl Future<Output = Result<Option<String>>> + Send;
+
+    /// Like `check_sat()`, but in the SAT case, asks the solver for a model
+    /// and returns it as a string.
+    ///
+    /// This function is responsible for adding both `SmtLibScript::check_sat()`
+    /// and `SmtLibScript::get_model()`.
+    ///
+    /// This signature could be written
+    /// `async fn check_sat_with_model(&mut self) -> Result<DecisionWithModel>;`
+    /// but that would not allow us to include the `Send` bound we need.
+    /// What you see here is basically a desugaring of the above, plus the
+    /// `Send` bound. See <https://blog.rust-lang.org/2023/12/21/async-fn-rpit-in-traits/#async-fn-in-public-traits>
+    ///
+    /// Note that implementors of this trait, like `LocalSolver` and
+    /// `WriterSolver` below, can still use the `async fn` syntax sugar to
+    /// implement this.
+    fn check_sat_with_model(&mut self) -> impl Future<Output = Result<DecisionWithModel>> + Send;
 }
 
 /// A solver instance that communicates with a local SMT solver process
@@ -182,6 +245,15 @@ impl Solver for LocalSolver {
         &mut self.solver_stdin
     }
 
+    async fn enable_models(&mut self) -> Result<()> {
+        // The `LocalSolver` implementation doesn't need to do anything other than
+        // set the appropriate SMTLib option.
+        self.smtlib_input()
+            .set_option("produce-models", "true")
+            .await
+            .map_err(Into::into)
+    }
+
     async fn check_sat(&mut self) -> Result<Decision> {
         self.check_child_process_status().await?;
         self.smtlib_input().check_sat().await?;
@@ -196,34 +268,37 @@ impl Solver for LocalSolver {
         }
     }
 
-    async fn get_model(&mut self) -> Result<Option<String>> {
-        self.check_child_process_status().await?;
-        self.smtlib_input().get_model().await?;
-        self.solver_stdin.flush().await?;
-        let mut output = String::new();
-
-        // We assume that the output is one of the following forms:
-        // 1. "(\n<the actual model>\n)\n"
-        // 2. "(error ...)\n"
-
-        // Read the first line
-        self.read_line(&mut output).await?;
-        match output.as_str() {
-            "(\n" => {
-                // Read until a line ")\n"
-                loop {
-                    let len: usize = self.read_line(&mut output).await?;
-                    #[expect(
-                        clippy::string_slice,
-                        reason = "`output.len() - len` gives the end index of `output` before the `read_line`"
-                    )]
-                    if &output[output.len() - len..] == ")\n" {
-                        break;
+    async fn check_sat_with_model(&mut self) -> Result<DecisionWithModel> {
+        match self.check_sat().await? {
+            Decision::Sat => {
+                // in the SAT case, we ask the solver for a model, which we expect to be in one of the following forms:
+                // 1. "(\n<the actual model>\n)\n"
+                // 2. "(error ...)\n"
+                self.smtlib_input().get_model().await?;
+                self.solver_stdin.flush().await?;
+                let mut output = String::new();
+                self.read_line(&mut output).await?;
+                match output.as_str() {
+                    "(\n" => {
+                        // Read until a line ")\n"
+                        loop {
+                            let len: usize = self.read_line(&mut output).await?;
+                            #[expect(
+                                clippy::string_slice,
+                                reason = "`output.len() - len` gives the end index of `output` before the `read_line`"
+                            )]
+                            if &output[output.len() - len..] == ")\n" {
+                                break;
+                            }
+                        }
+                        Ok(DecisionWithModel::Sat { model: output })
                     }
+                    s => Err(self.process_error_output(s).await),
                 }
-                Ok(Some(output))
             }
-            s => Err(self.process_error_output(s).await),
+            // in the UNSAT/UNKNOWN case, we don't ask for a model
+            Decision::Unsat => Ok(DecisionWithModel::Unsat),
+            Decision::Unknown => Ok(DecisionWithModel::Unknown),
         }
     }
 }
@@ -292,15 +367,24 @@ impl<W: tokio::io::AsyncWrite + Unpin + Send> Solver for WriterSolver<W> {
     fn smtlib_input(&mut self) -> &mut (dyn tokio::io::AsyncWrite + Unpin + Send) {
         &mut self.w
     }
+    async fn enable_models(&mut self) -> Result<()> {
+        // The `WriterSolver` implementation doesn't need to do anything other
+        // than set the appropriate SMTLib option.
+        self.smtlib_input()
+            .set_option("produce-models", "true")
+            .await
+            .map_err(Into::into)
+    }
     async fn check_sat(&mut self) -> Result<Decision> {
         self.smtlib_input().check_sat().await?;
         self.w.flush().await?;
         Ok(Decision::Unknown)
     }
-    async fn get_model(&mut self) -> Result<Option<String>> {
-        self.smtlib_input().get_model().await?;
+    async fn check_sat_with_model(&mut self) -> Result<DecisionWithModel> {
+        self.smtlib_input().check_sat().await?;
+        // Since the decision is always `Unknown`, we should not emit get-model for consistency.
         self.w.flush().await?;
-        Ok(None)
+        Ok(DecisionWithModel::Unknown)
     }
 }
 
@@ -360,30 +444,21 @@ mod test {
     #[tokio::test]
     async fn get_model_sat() {
         let mut my_solver = LocalSolver::cvc5().unwrap();
-        my_solver
-            .smtlib_input()
-            .set_option("produce-models", "true")
-            .await
-            .unwrap();
+        my_solver.enable_models().await.unwrap();
         my_solver.smtlib_input().assert("true").await.unwrap();
-        let decision = my_solver.check_sat().await.unwrap();
-        assert_eq!(decision, Decision::Sat);
-        let model = my_solver.get_model().await.unwrap();
-        assert!(model.is_some());
+        let decision = my_solver.check_sat_with_model().await.unwrap();
+        assert_matches!(decision, DecisionWithModel::Sat { model } => {
+            assert!(!model.is_empty());
+        });
     }
 
     #[tokio::test]
     async fn get_model_unsat() {
         let mut my_solver = LocalSolver::cvc5().unwrap();
-        my_solver
-            .smtlib_input()
-            .set_option("produce-models", "true")
-            .await
-            .unwrap();
+        my_solver.enable_models().await.unwrap();
         my_solver.smtlib_input().assert("false").await.unwrap();
-        let decision = my_solver.check_sat().await.unwrap();
-        assert_eq!(decision, Decision::Unsat);
-        my_solver.get_model().await.unwrap_err();
+        let decision = my_solver.check_sat_with_model().await.unwrap();
+        assert_eq!(decision, DecisionWithModel::Unsat);
     }
 
     #[tokio::test]
