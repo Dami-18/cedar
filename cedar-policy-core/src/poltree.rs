@@ -18,12 +18,15 @@
  
 use crate::ast::*;
 use crate::authorizer::Decision;
-use crate::entities::Entities; // can we use this somehow, it already provides lookups by entity IDs
+use crate::entities::{Dereference, Entities};
 use smol_str::SmolStr;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
+/// struct representing the entire PolTree
 #[derive(Debug)]
 pub struct PolTree {
+    /// Root node of the PolTree
     pub root: PolTreeNode,
 }
 
@@ -56,20 +59,16 @@ impl PolTree {
                 return make_leaf(policy_ids, entities);
             }
 
-            // best_attribute uses only `entities` (sv), so call it directly
-            // without constructing a probe node.
             let best_attr = match best_attribute(&entities, index, &attrs) {
                 Some(a) => a,
                 None => return make_leaf(policy_ids, entities), // no information gain
             };
 
             // Build HashSets once before the loop so every membership test
-            // is O(1) instead of O(n).
+            // is O(1) instead of O(n)
             let policy_set: HashSet<&PolicyID> = policy_ids.iter().collect();
             let entity_set: HashSet<&EntityUID> = entities.iter().collect();
 
-            // Borrow the value set — use a local empty set as fallback
-            // so we never need to clone the whole HashSet.
             let empty_values = HashSet::new();
             let values: &HashSet<Literal> = index
                 .attr_values
@@ -98,7 +97,6 @@ impl PolTree {
                         .filter(|e| entity_set.contains(e))
                         .collect();
 
-                    // Set attr_val directly instead of mutating after construction.
                     let mut child = build_node(pv, remaining_attrs.clone(), sv, index);
                     child.attr_val = Some((best_attr.clone(), val.clone()));
                     Box::new(child)
@@ -123,7 +121,9 @@ impl PolTree {
 /// Indexes built from a PolicySet + Entities for efficient N-PolTree construction
 #[derive(Debug, Clone)]
 pub struct PolTreeIndex {
-    /// All attribute names and the set of values they are compared against across the policy set
+    /// The entity hierarchy this index was built from
+    pub entities: Arc<Entities>,
+    /// All attribute names and the set of literal values they take across all entities
     pub attr_values: HashMap<SmolStr, HashSet<Literal>>,
     /// Given (attr, val), which policy IDs constrain attr == val
     pub pv_map: HashMap<(SmolStr, Literal), Vec<PolicyID>>,
@@ -133,6 +133,54 @@ pub struct PolTreeIndex {
     pub policy_entities_map: HashMap<PolicyID, Vec<EntityUID>>,
 }
 impl PolTreeIndex {
+    /// Build a `PolTreeIndex` from an `Entities` store and caller-provided policy maps
+    pub fn build_from_entities(
+        entities: Arc<Entities>,
+        pv_map: HashMap<(SmolStr, Literal), Vec<PolicyID>>,
+        policy_entities_map: HashMap<PolicyID, Vec<EntityUID>>,
+    ) -> Self {
+        let mut attr_values: HashMap<SmolStr, HashSet<Literal>> = HashMap::new();
+        let mut sv_map: HashMap<(SmolStr, Literal), Vec<EntityUID>> = HashMap::new();
+
+        for entity in entities.iter() {
+            let uid = entity.uid().clone();
+            for (attr, pval) in entity.attrs() {
+                // Only index scalar (Literal) values; skip sets, records, residuals
+                if let PartialValue::Value(v) = pval {
+                    if let Some(lit) = v.try_as_lit() {
+                        let lit = lit.clone();
+                        attr_values
+                            .entry(attr.clone())
+                            .or_default()
+                            .insert(lit.clone());
+                        sv_map
+                            .entry((attr.clone(), lit))
+                            .or_default()
+                            .push(uid.clone());
+                    }
+                }
+            }
+        }
+        for (attr, val) in pv_map.keys() {
+            attr_values
+                .entry(attr.clone())
+                .or_default()
+                .insert(val.clone());
+        }
+        Self {
+            entities,
+            attr_values,
+            pv_map,
+            sv_map,
+            policy_entities_map,
+        }
+    }
+
+    /// Look up a full [`Entity`] by UID, delegating to the underlying [`Entities`] store
+    pub fn get_entity(&self, uid: &EntityUID) -> Dereference<'_, Entity> {
+        self.entities.entity(uid)
+    }
+
     /// Get the policy IDs where attr equals val
     pub fn get_pv(&self, attr: &SmolStr, val: &Literal) -> &[PolicyID] {
         self.pv_map
@@ -147,12 +195,12 @@ impl PolTreeIndex {
     }
     /// Get all entity UIDs covered by the given set of policies
     pub fn get_sv_for_policies(&self, policy_ids: &[PolicyID]) -> Vec<EntityUID> {
-        let mut seen = HashSet::new();
+        let mut seen: HashSet<&EntityUID> = HashSet::new();
         let mut result = Vec::new();
         for pid in policy_ids {
             if let Some(entities) = self.policy_entities_map.get(pid) {
                 for e in entities {
-                    if seen.insert(e.clone()) {
+                    if seen.insert(e) {
                         result.push(e.clone());
                     }
                 }
@@ -162,9 +210,6 @@ impl PolTreeIndex {
     }
 }
 
-/// Entropy of `attr` over `sv`.
-/// Builds a `HashSet` from `sv` **once** so every per-value membership test
-/// is O(1) rather than O(|sv|).
 fn attr_entropy(sv: &[EntityUID], index: &PolTreeIndex, attr: &SmolStr) -> f64 {
     let values = match index.attr_values.get(attr) {
         Some(v) => v,
@@ -193,7 +238,6 @@ fn attr_entropy(sv: &[EntityUID], index: &PolTreeIndex, attr: &SmolStr) -> f64 {
         .sum()
 }
 
-/// Pick the attribute with the highest entropy over `sv`.
 fn best_attribute(sv: &[EntityUID], index: &PolTreeIndex, attrs: &[SmolStr]) -> Option<SmolStr> {
     attrs
         .iter()
@@ -216,24 +260,4 @@ pub struct PolTreeNode {
     pub pv: Vec<PolicyID>,
     /// Final access decision for leaf nodes
     pub eval: Option<Decision>,
-}
-
-impl PolTreeNode {
-    /// Entity UIDs in this node's sv that have attr = val
-    pub fn get_sv<'a>(&self, index: &'a PolTreeIndex, attr: &SmolStr, val: &Literal) -> Vec<&'a EntityUID> {
-        let sv_set: HashSet<&EntityUID> = self.sv.iter().collect();
-        index
-            .get_sv(attr, val)
-            .iter()
-            .filter(|e| sv_set.contains(e))
-            .collect()
-    }
-    /// Entropy of attribute over this node's entity set
-    pub fn entropy(&self, index: &PolTreeIndex, attr: &SmolStr) -> f64 {
-        attr_entropy(&self.sv, index, attr)
-    }
-    /// Attribute with the highest entropy (best split)
-    pub fn best_attribute(&self, index: &PolTreeIndex, attrs: &[SmolStr]) -> Option<SmolStr> {
-        best_attribute(&self.sv, index, attrs)
-    }
 }
