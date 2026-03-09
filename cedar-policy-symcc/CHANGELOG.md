@@ -8,10 +8,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 Cedar Language Version: TBD
 
-### Added
-
-- `Display` impl for `Env` (#2182)
-
 ### Changed
 
 - Refactored `Solver` trait to include `check_sat_with_model()` instead of `get_model()`,
@@ -20,9 +16,16 @@ to make the API easier to use with fewer implicit ordering constraints (#2190)
 some implementors of `Solver` to perform other initialization/configuration as
 required when models are being enabled (#2192)
 
+## [0.3.1] - Coming soon
+Cedar Language Version: 4.4
+
+### Added
+
+- `Display` impl for `Env` (#2182)
+
 ### Fixed
 
-- Fixed bug in `Term::interpret` caused by missing `bvsrem` case (#2185)
+- Fixed bug in `Term::interpret` caused by missing `bvsrem` case (#2185, #2203)
 
 ## [0.3.0] - 2026-02-17
 Cedar Language Version: 4.4
