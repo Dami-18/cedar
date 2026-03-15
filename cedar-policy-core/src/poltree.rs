@@ -23,6 +23,34 @@ use smol_str::SmolStr;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+// Expr-tree walker: extract (attr, Literal) equality constraints from the non-scope condition of a policy
+fn collect_attr_constraints(expr: &Expr, constraints: &mut Vec<(SmolStr, Literal)>) { 
+    match expr.expr_kind() {
+        ExprKind::And { left, right } => {
+            collect_attr_constraints(left, constraints);
+            collect_attr_constraints(right, constraints);
+        }
+        ExprKind::BinaryApp { op: BinaryOp::Eq, arg1, arg2 } => {
+            match (arg1.expr_kind(), arg2.expr_kind()) {
+                (
+                    ExprKind::GetAttr { expr: base, attr }, // rename to base to avoid conflict with function argument
+                    ExprKind::Lit(lit),
+                ) if matches!(base.expr_kind(), ExprKind::Var(Var::Resource) | ExprKind::Var(Var::Principal)) => {
+                    constraints.push((attr.clone(), lit.clone()));
+                }
+                (
+                    ExprKind::Lit(lit),
+                    ExprKind::GetAttr { expr: base, attr },
+                ) if matches!(base.expr_kind(), ExprKind::Var(Var::Resource) | ExprKind::Var(Var::Principal)) => {
+                    constraints.push((attr.clone(), lit.clone()));
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
 /// struct representing the entire PolTree
 #[derive(Debug)]
 pub struct PolTree {
@@ -38,7 +66,10 @@ impl PolTree {
         entities: Vec<EntityUID>,
         index: &PolTreeIndex,
     ) -> Self {
-        fn make_leaf(policy_ids: Vec<PolicyID>, entities: Vec<EntityUID>) -> PolTreeNode {
+        fn make_leaf(
+            policy_ids: Vec<PolicyID>,
+            entities: Vec<EntityUID>,
+        ) -> PolTreeNode {
             let decision = if policy_ids.is_empty() { Decision::Deny } else { Decision::Allow };
             PolTreeNode {
                 attr_val: None,
@@ -59,21 +90,19 @@ impl PolTree {
                 return make_leaf(policy_ids, entities);
             }
 
-            let best_attr = match best_attribute(&entities, index, &attrs) {
+            let best_attr = match best_attribute(&policy_ids, &entities, index, &attrs) {
                 Some(a) => a,
                 None => return make_leaf(policy_ids, entities), // no information gain
             };
 
-            // Build HashSets once before the loop so every membership test
-            // is O(1) instead of O(n)
+            // Build HashSets once before the loop so every membership test is O(1) instead of O(n)
             let policy_set: HashSet<&PolicyID> = policy_ids.iter().collect();
             let entity_set: HashSet<&EntityUID> = entities.iter().collect();
 
-            let empty_values = HashSet::new();
-            let values: &HashSet<Literal> = index
-                .attr_values
-                .get(&best_attr)
-                .unwrap_or(&empty_values);
+            let values = index.values_for_attr_in_policies(&best_attr, &policy_set);
+            if values.is_empty() {
+                return make_leaf(policy_ids, entities);
+            }
 
             // A − {a}: consume `attrs` in-place instead of iter + clone
             let remaining_attrs: Vec<SmolStr> =
@@ -133,6 +162,71 @@ pub struct PolTreeIndex {
     pub policy_entities_map: HashMap<PolicyID, Vec<EntityUID>>,
 }
 impl PolTreeIndex {
+    /// Build a `PolTreeIndex` directly from a [`PolicySet`] and an [`Entities`] store.
+    ///
+    /// This is the preferred constructor: it derives `pv_map` and
+    /// `policy_entities_map` automatically by walking each policy's condition
+    /// expression and matching the extracted attribute constraints against the
+    /// entity store, so callers do not need to supply those maps manually.
+    ///
+    /// Only flat equality constraints of the form
+    /// `resource.attr == <literal>` (or `principal.attr == <literal>`) are
+    /// recognised; more complex conditions are ignored (safe under-approximation).
+    pub fn build_from_policy_set(policy_set: &PolicySet, entities: Arc<Entities>) -> Self {
+        let mut pv_map: HashMap<(SmolStr, Literal), Vec<PolicyID>> = HashMap::new();
+        let mut policy_entities_map: HashMap<PolicyID, Vec<EntityUID>> = HashMap::new();
+
+        for policy in policy_set.policies() {
+            let pid = policy.id().clone();
+            let mut constraints: Vec<(SmolStr, Literal)> = Vec::new();
+
+            // Walk the non-scope (when/unless) condition expression
+            if let Some(expr) = policy.template().non_scope_constraints() {
+                collect_attr_constraints(expr, &mut constraints);
+            }
+
+            // Register each extracted constraint in pv_map
+            for (attr, val) in &constraints {
+                pv_map
+                    .entry((attr.clone(), val.clone()))
+                    .or_default()
+                    .push(pid.clone());
+            }
+
+            // Compute policy_entities_map: entities that satisfy ALL extracted
+            // constraints for this policy (intersection across constraints)
+            // If no constraints were found, no entities are associated
+            if !constraints.is_empty() {
+                // Start with the candidates for the first constraint, then intersect with candidates for each subsequent constraint.
+                let mut covered: Option<HashSet<EntityUID>> = None;
+                for (attr, val) in &constraints {
+                    let candidates: HashSet<EntityUID> = entities
+                        .iter()
+                        .filter(|e| {
+                            if let Some(pv) = e.get(attr) {
+                                if let PartialValue::Value(v) = pv {
+                                    return v.try_as_lit() == Some(val);
+                                }
+                            }
+                            false
+                        })
+                        .map(|e| e.uid().clone())
+                        .collect();
+
+                    covered = Some(match covered.take() {
+                        None => candidates,
+                        Some(existing) => existing.intersection(&candidates).cloned().collect(),
+                    });
+                }
+                if let Some(set) = covered {
+                    policy_entities_map.insert(pid, set.into_iter().collect());
+                }
+            }
+        }
+
+        Self::build_from_entities(entities, pv_map, policy_entities_map)
+    }
+
     /// Build a `PolTreeIndex` from an `Entities` store and caller-provided policy maps
     pub fn build_from_entities(
         entities: Arc<Entities>,
@@ -208,6 +302,23 @@ impl PolTreeIndex {
         }
         result
     }
+
+    fn values_for_attr_in_policies(
+        &self,
+        attr: &SmolStr,
+        policy_ids: &HashSet<&PolicyID>,
+    ) -> Vec<Literal> {
+        self.pv_map
+            .iter()
+            .filter(|((candidate_attr, _), ids)| {
+                candidate_attr == attr && ids.iter().any(|id| policy_ids.contains(id))
+            })
+            .map(|((_, val), _)| val.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
 }
 
 fn attr_entropy(sv: &[EntityUID], index: &PolTreeIndex, attr: &SmolStr) -> f64 {
@@ -238,9 +349,17 @@ fn attr_entropy(sv: &[EntityUID], index: &PolTreeIndex, attr: &SmolStr) -> f64 {
         .sum()
 }
 
-fn best_attribute(sv: &[EntityUID], index: &PolTreeIndex, attrs: &[SmolStr]) -> Option<SmolStr> {
+fn best_attribute(
+    policy_ids: &[PolicyID],
+    sv: &[EntityUID],
+    index: &PolTreeIndex,
+    attrs: &[SmolStr],
+) -> Option<SmolStr> {
+    let policy_set: HashSet<&PolicyID> = policy_ids.iter().collect();
+
     attrs
         .iter()
+        .filter(|attr| !index.values_for_attr_in_policies(attr, &policy_set).is_empty())
         .map(|attr| (attr, attr_entropy(sv, index, attr)))
         .filter(|(_, h)| h.is_finite() && *h > 0.0)
         .max_by(|(_, h1), (_, h2)| h1.partial_cmp(h2).unwrap())
