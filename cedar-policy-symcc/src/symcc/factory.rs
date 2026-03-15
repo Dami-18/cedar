@@ -522,8 +522,7 @@ pub fn set_inter(ts1: Term, ts2: Term) -> Term {
 
 pub fn set_is_empty(t: Term) -> Term {
     match t {
-        Term::Set { elts, .. } if elts.is_empty() => true.into(),
-        Term::Set { elts, .. } if !elts.is_empty() => false.into(),
+        Term::Set { elts, .. } => elts.is_empty().into(),
         ts => match ts.type_of() {
             TermType::Set { ty } => eq(
                 ts,
@@ -617,7 +616,9 @@ pub fn ext_ipaddr_is_v4(t: Term) -> Term {
 
 pub fn ext_ipaddr_addr_v4(t: Term) -> Term {
     match t {
-        Term::Prim(TermPrim::Ext(Ext::Ipaddr { ip: IPNet::V4(v4) })) => v4.addr.val.into(),
+        Term::Prim(TermPrim::Ext(Ext::Ipaddr { ip: IPNet::V4(v4) })) => {
+            v4.addr.into_bitvec().into()
+        }
         t => Term::App {
             op: Op::Ext(ExtOp::IpaddrAddrV4),
             args: Arc::new(vec![t]),
@@ -628,10 +629,12 @@ pub fn ext_ipaddr_addr_v4(t: Term) -> Term {
 
 pub fn ext_ipaddr_prefix_v4(t: Term) -> Term {
     match t {
-        Term::Prim(TermPrim::Ext(Ext::Ipaddr { ip: IPNet::V4(v4) })) => match v4.prefix.val {
-            None => Term::None(TermType::Bitvec { n: FIVE }),
-            Some(p) => some_of(p.into()),
-        },
+        Term::Prim(TermPrim::Ext(Ext::Ipaddr { ip: IPNet::V4(v4) })) => {
+            match v4.prefix.into_bitvec() {
+                None => Term::None(TermType::Bitvec { n: FIVE }),
+                Some(p) => some_of(p.into()),
+            }
+        }
         t => Term::App {
             op: Op::Ext(ExtOp::IpaddrPrefixV4),
             args: Arc::new(vec![t]),
@@ -642,7 +645,9 @@ pub fn ext_ipaddr_prefix_v4(t: Term) -> Term {
 
 pub fn ext_ipaddr_addr_v6(t: Term) -> Term {
     match t {
-        Term::Prim(TermPrim::Ext(Ext::Ipaddr { ip: IPNet::V6(v6) })) => v6.addr.val.into(),
+        Term::Prim(TermPrim::Ext(Ext::Ipaddr { ip: IPNet::V6(v6) })) => {
+            v6.addr.into_bitvec().into()
+        }
         t => Term::App {
             op: Op::Ext(ExtOp::IpaddrAddrV6),
             args: Arc::new(vec![t]),
@@ -655,10 +660,12 @@ pub fn ext_ipaddr_addr_v6(t: Term) -> Term {
 
 pub fn ext_ipaddr_prefix_v6(t: Term) -> Term {
     match t {
-        Term::Prim(TermPrim::Ext(Ext::Ipaddr { ip: IPNet::V6(v6) })) => match v6.prefix.val {
-            None => Term::None(TermType::Bitvec { n: SEVEN }),
-            Some(p) => some_of(p.into()),
-        },
+        Term::Prim(TermPrim::Ext(Ext::Ipaddr { ip: IPNet::V6(v6) })) => {
+            match v6.prefix.into_bitvec() {
+                None => Term::None(TermType::Bitvec { n: SEVEN }),
+                Some(p) => some_of(p.into()),
+            }
+        }
         t => Term::App {
             op: Op::Ext(ExtOp::IpaddrPrefixV6),
             args: Arc::new(vec![t]),

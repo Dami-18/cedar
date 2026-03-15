@@ -14,14 +14,20 @@
  * limitations under the License.
  */
 
-//! Expression types for PST
+//! Expression types for PST.
+//!
+//! This module defines the expression tree used in Cedar policy conditions
+//! (`when` / `unless` clauses). Expressions are recursive via [`Arc<Expr>`].
 
-use super::err::{error_body, PstConstructionError};
+use super::err::{
+    error_body::{self},
+    PstConstructionError,
+};
 use crate::ast;
 use crate::expr_builder::ExprBuilder;
 use crate::extensions::Extensions;
 use smol_str::{SmolStr, ToSmolStr};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Display;
 use std::sync::Arc;
 
@@ -35,15 +41,26 @@ mod constants {
     pub static OR_STR: &str = "||";
 }
 
-/// Slot identifier for template policies
+/// Slot identifier for template policies.
 ///
-/// Cedar supports two slot types: `principal` and `resource`
+/// In Cedar, template slots are placeholders written as `?principal` or `?resource`
+/// that get filled in when a template is instantiated into a concrete policy.
+///
+/// ```cedar
+/// permit (
+///   principal == ?principal,
+///   action == Action::"view",
+///   resource in ?resource
+/// );
+/// ```
+///
+/// This enum is `#[non_exhaustive]`; match arms must include a wildcard.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum SlotId {
-    /// Principal slot
+    /// `?principal` slot
     Principal,
-    /// Resource slot
+    /// `?resource` slot
     Resource,
 }
 
@@ -54,10 +71,20 @@ impl Display for SlotId {
     }
 }
 
-/// A qualified name (e.g., `Namespace::Type`)
+/// A qualified name (e.g., `Namespace::Type`).
 ///
 /// Represents entity types, action names, and other identifiers in Cedar.
 /// Names consist of a basename and optional namespace components.
+///
+/// ```cedar
+/// // Unqualified: just a basename
+/// User
+/// Photo
+///
+/// // Qualified: namespace components followed by basename
+/// MyApp::User
+/// AWS::EC2::Instance
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Name {
     /// Basename (the final component of the name)
@@ -98,9 +125,14 @@ impl Display for Name {
     }
 }
 
-/// Entity type name
+/// Entity type name.
 ///
-/// Represents the type of an entity in Cedar (e.g., `User`, `Photo`, `Namespace::Resource`)
+/// Represents the type of an entity in Cedar.
+///
+/// ```cedar
+/// User            // unqualified
+/// MyApp::Photo    // qualified with namespace
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EntityType(pub Name);
 
@@ -121,9 +153,15 @@ impl Display for EntityType {
     }
 }
 
-/// Entity unique identifier (UID)
+/// Entity unique identifier (UID).
 ///
-/// Represents a specific entity instance in Cedar (e.g., `User::"alice"`)
+/// Represents a specific entity instance in Cedar, written as `Type::"id"`.
+///
+/// ```cedar
+/// User::"alice"
+/// Photo::"vacation.jpg"
+/// MyApp::Action::"readFile"
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EntityUID {
     /// Type of the entity
@@ -138,58 +176,99 @@ impl Display for EntityUID {
     }
 }
 
-/// Variables available in Cedar policy expressions
+/// Variables available in Cedar policy expressions.
+///
+/// Cedar provides four built-in variables that refer to the authorization request:
+///
+/// ```cedar
+/// principal       // the entity making the request
+/// action          // the action being requested
+/// resource        // the entity the action targets
+/// context         // the request context record
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Var {
-    /// The `principal` variable
+    /// `principal` — the entity making the request
     Principal,
-    /// The `action` variable
+    /// `action` — the action being requested
     Action,
-    /// The `resource` variable
+    /// `resource` — the entity the action targets
     Resource,
-    /// The `context` variable
+    /// `context` — the request context record
     Context,
 }
 
-/// Unary operators in Cedar expressions
+/// Unary operators in Cedar expressions.
+///
+/// Includes built-in operators and extension functions that take a single argument.
+///
+/// This enum is `#[non_exhaustive]`; match arms must include a wildcard.
+///
+/// ```cedar
+/// // Built-in operators
+/// !context.is_admin           // Not
+/// -(1)                        // Neg
+/// [].isEmpty()                // IsEmpty
+///
+/// // Extension constructors
+/// decimal("1.23")             // Decimal
+/// ip("10.0.0.1")              // Ip
+/// datetime("2024-01-01")      // Datetime
+/// duration("1h30m")           // Duration
+///
+/// // IP extension methods
+/// ip("10.0.0.1").isIpv4()     // IsIPv4
+/// ip("::1").isIpv6()          // IsIPV6
+/// ip("127.0.0.1").isLoopback()   // IsLoopback
+/// ip("224.0.0.1").isMulticast()  // IsMulticast
+///
+/// // Datetime extension methods
+/// datetime("2024-01-01").toDate()           // ToDate
+/// datetime("2024-01-01T12:00:00Z").toTime() // ToTime
+/// duration("1h30m").toMilliseconds()        // ToMilliseconds
+/// duration("1h30m").toSeconds()             // ToSeconds
+/// duration("1h30m").toMinutes()             // ToMinutes
+/// duration("1h30m").toHours()               // ToHours
+/// duration("30d").toDays()                  // ToDays
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum UnaryOp {
-    /// Logical not (`!`)
+    /// `!expr`
     Not,
-    /// Arithmetic negation (`-`)
+    /// `-(expr)`
     Neg,
-    /// Test set empty
+    /// `expr.isEmpty()`
     IsEmpty,
-    /// Parse string and construct a datetime
+    /// `datetime("...")`
     Datetime,
-    /// Parse string and construct a decimal
+    /// `decimal("...")`
     Decimal,
-    /// Parse string and construct a duration
+    /// `duration("...")`
     Duration,
-    /// Parse string and construct an ip address
+    /// `ip("...")`
     Ip,
-    /// Test for a valid ipv4 address
+    /// `expr.isIpv4()`
     IsIPv4,
-    /// Test for a valid ipv6 address
+    /// `expr.isIpv6()`
     IsIPV6,
-    /// Test for IP loopback address
+    /// `expr.isLoopback()`
     IsLoopback,
-    /// Test for multicast address
+    /// `expr.isMulticast()`
     IsMulticast,
-    /// Extract date portion as new datetime
+    /// `expr.toDate()`
     ToDate,
-    /// Extract time as duration
+    /// `expr.toTime()`
     ToTime,
-    /// Convert to milliseconds
+    /// `expr.toMilliseconds()`
     ToMilliseconds,
-    /// Convert to seconds
+    /// `expr.toSeconds()`
     ToSeconds,
-    /// Convert to minutes
+    /// `expr.toMinutes()`
     ToMinutes,
-    /// Convert to hours
+    /// `expr.toHours()`
     ToHours,
-    /// Convert to days
+    /// `expr.toDays()`
     ToDays,
 }
 
@@ -256,56 +335,89 @@ impl Display for UnaryOp {
     }
 }
 
-/// Binary operators in Cedar expressions
+/// Binary operators in Cedar expressions.
+///
+/// Includes built-in operators and extension functions that take two arguments.
+///
+/// This enum is `#[non_exhaustive]`; match arms must include a wildcard.
+///
+/// ```cedar
+/// // Comparison
+/// principal == User::"alice"          // Eq
+/// principal != User::"bob"            // NotEq
+/// context.age < 18                    // Less
+/// context.age <= 21                   // LessEq
+/// context.age > 13                    // Greater
+/// context.age >= 65                   // GreaterEq
+///
+/// // Logical
+/// true && false                       // And
+/// true || false                       // Or
+///
+/// // Arithmetic
+/// context.x + 1                       // Add
+/// context.x - 1                       // Sub
+/// context.x * 2                       // Mul
+///
+/// // Hierarchy / set
+/// principal in Group::"admins"        // In
+/// [1, 2, 3].contains(2)              // Contains
+/// [1, 2].containsAll([1])            // ContainsAll
+/// [1, 2].containsAny([2, 3])         // ContainsAny
+///
+/// // Tags
+/// resource.hasTag("env")              // HasTag
+/// resource.getTag("env")              // GetTag
+///
+/// // IP extension
+/// ip("10.0.0.1").isInRange(ip("10.0.0.0/24"))  // IsInRange
+///
+/// // Datetime extension
+/// datetime("2024-01-01").offset(duration("1d")) // Offset
+/// datetime("2024-01-02").durationSince(datetime("2024-01-01")) // DurationSince
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum BinaryOp {
-    // Comparison
-    /// Equality (`==`)
+    /// `left == right`
     Eq,
-    /// Inequality (`!=`)
+    /// `left != right`
     NotEq,
-    /// Less than (`<`)
+    /// `left < right`
     Less,
-    /// Less than or equal (`<=`)
+    /// `left <= right`
     LessEq,
-    /// Greater than (`>`)
+    /// `left > right`
     Greater,
-    /// Greater than or equal (`>=`)
+    /// `left >= right`
     GreaterEq,
-    // Logical
-    /// Logical AND (`&&`)
+    /// `left && right`
     And,
-    /// Logical OR (`||`)
+    /// `left || right`
     Or,
-    // Arithmetic
-    /// Addition (`+`)
+    /// `left + right`
     Add,
-    /// Subtraction (`-`)
+    /// `left - right`
     Sub,
-    /// Multiplication (`*`)
+    /// `left * right`
     Mul,
-    // Set/hierarchy
-    /// Hierarchy membership (`in`)
+    /// `left in right`
     In,
-    /// Set contains element (`contains`)
+    /// `left.contains(right)`
     Contains,
-    /// Set contains all elements (`containsAll`)
+    /// `left.containsAll(right)`
     ContainsAll,
-    /// Set contains any element (`containsAny`)
+    /// `left.containsAny(right)`
     ContainsAny,
-    // Tags
-    /// Get tag value (`getTag`)
+    /// `left.getTag(right)`
     GetTag,
-    /// Check tag existence (`hasTag`)
+    /// `left.hasTag(right)`
     HasTag,
-    // Ip operations
-    /// Test for inclusion in IP address range
+    /// `left.isInRange(right)`
     IsInRange,
-    // Datetime
-    /// Compute a datetime offset by duration
+    /// `left.offset(right)`
     Offset,
-    /// Compute difference between two datetimes
+    /// `left.durationSince(right)`
     DurationSince,
 }
 
@@ -381,47 +493,81 @@ impl Display for BinaryOp {
     }
 }
 
-/// Literal values
+/// Literal values in Cedar expressions.
+///
+/// This enum is `#[non_exhaustive]`; match arms must include a wildcard.
+///
+/// ```cedar
+/// true                    // Bool
+/// 42                      // Long
+/// "hello"                 // String
+/// User::"alice"           // EntityUID
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Literal {
-    /// Boolean literal
+    /// `true` or `false`
     Bool(bool),
-    /// Integer literal
+    /// Integer literal (e.g., `42`, `-1`)
     Long(i64),
-    /// String literal
+    /// String literal (e.g., `"hello"`)
     String(SmolStr),
-    /// Entity UID literal
+    /// Entity UID literal (e.g., `User::"alice"`)
     EntityUID(EntityUID),
 }
 
-/// Pattern element for `like` expressions
+/// Pattern element for `like` expressions.
+///
+/// A pattern is a sequence of literal characters and wildcards used with the `like` operator:
+///
+/// ```cedar
+/// resource.name like "*.jpg"      // Wildcard then Char('.')...
+/// resource.name like "photo_*"    // Char('p')... then Wildcard
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PatternElem {
-    /// A literal character
+    /// A literal character in the pattern
     Char(char),
-    /// A wildcard (`*`)
+    /// A wildcard (`*`) matching zero or more characters
     Wildcard,
 }
 
-/// PST Expression
+/// PST Expression — the core expression type for Cedar policy conditions.
+///
+/// This enum is `#[non_exhaustive]`; match arms must include a wildcard.
+///
+/// Each variant corresponds to a Cedar syntax construct. See individual variant docs
+/// for the Cedar syntax each one represents.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Expr {
-    /// Literal value
+    /// A literal value: `true`, `42`, `"hello"`, or `User::"alice"`.
     Literal(Literal),
-    /// Variable (principal, action, resource, context)
+    /// A built-in variable: `principal`, `action`, `resource`, or `context`.
     Var(Var),
-    /// Template slot
+    /// A template slot: `?principal` or `?resource`.
     Slot(SlotId),
-    /// Unary operation
+    /// A unary operation.
+    ///
+    /// ```cedar
+    /// !expr           // UnaryOp::Not
+    /// -(expr)         // UnaryOp::Neg
+    /// expr.isEmpty()  // UnaryOp::IsEmpty
+    /// decimal("1.0")  // UnaryOp::Decimal
+    /// ```
     UnaryOp {
         /// The operator
         op: UnaryOp,
         /// The operand
         expr: Arc<Expr>,
     },
-    /// Binary operation
+    /// A binary operation.
+    ///
+    /// ```cedar
+    /// context.age >= 18                   // BinaryOp::GreaterEq
+    /// principal in Group::"admins"        // BinaryOp::In
+    /// [1, 2].contains(1)                 // BinaryOp::Contains
+    /// ```
     BinaryOp {
         /// The operator
         op: BinaryOp,
@@ -430,39 +576,62 @@ pub enum Expr {
         /// Right operand
         right: Arc<Expr>,
     },
-    /// Attribute access (e.g., `principal.name`)
+    /// Attribute access.
+    ///
+    /// ```cedar
+    /// principal.name
+    /// context.request.ip
+    /// ```
     GetAttr {
         /// Expression to get attribute from
         expr: Arc<Expr>,
         /// Attribute name
         attr: SmolStr,
     },
-    /// Attribute existence check (e.g., `principal has name`)
-    /// Can check nested attributes (e.g., `principal has address.street`)
+    /// Attribute existence check. Can check nested attributes.
+    ///
+    /// ```cedar
+    /// principal has name
+    /// principal has "0notACedarIdent"
+    /// principal has address.street
+    /// ```
+    /// If there are more than one attribute, all attributes must be valid Cedar identifiers.
     HasAttr {
         /// Expression to check for attribute
         expr: Arc<Expr>,
-        /// Attribute path (non-empty)
+        /// Attribute path (non-empty; multiple elements for nested checks)
         attrs: nonempty::NonEmpty<SmolStr>,
     },
-    /// Pattern matching (e.g., `resource.name like "*.jpg"`)
+    /// Pattern matching with the `like` operator.
+    ///
+    /// ```cedar
+    /// resource.name like "*.jpg"
+    /// ```
     Like {
         /// Expression to match
         expr: Arc<Expr>,
         /// Pattern to match against
         pattern: Vec<PatternElem>,
     },
-    /// Type test with optional hierarchy check
-    /// `expr is Type` or `expr is Type in parent`
+    /// Entity type test, optionally combined with a hierarchy check.
+    ///
+    /// ```cedar
+    /// principal is User
+    /// principal is User in Group::"admins"
+    /// ```
     Is {
         /// Expression to test
         expr: Arc<Expr>,
         /// Entity type to test for
         entity_type: EntityType,
-        /// Optional hierarchy parent
+        /// Optional `in` hierarchy parent
         in_expr: Option<Arc<Expr>>,
     },
-    /// Conditional expression
+    /// Conditional expression.
+    ///
+    /// ```cedar
+    /// if context.is_admin then "yes" else "no"
+    /// ```
     IfThenElse {
         /// Condition
         cond: Arc<Expr>,
@@ -471,16 +640,25 @@ pub enum Expr {
         /// Else branch
         else_expr: Arc<Expr>,
     },
-    /// Set literal
+    /// Set literal.
+    ///
+    /// ```cedar
+    /// [1, 2, 3]
+    /// [User::"alice", User::"bob"]
+    /// ```
     Set(Vec<Arc<Expr>>),
-    /// Record literal
+    /// Record literal.
+    ///
+    /// ```cedar
+    /// {"key": "value", "count": 42}
+    /// ```
     Record(BTreeMap<String, Arc<Expr>>),
-    /// Representation of an unknown for partial evaluation
+    /// An unknown value for partial evaluation (not part of Cedar surface syntax).
     Unknown {
         /// Name of the unknown
         name: SmolStr,
     },
-    /// An error occurred during construction
+    /// An error occurred during construction (not constructible by external callers).
     #[expect(
         private_interfaces,
         reason = "intentionally private to prevent clients from constructing error nodes"
@@ -488,7 +666,7 @@ pub enum Expr {
     Error(ErrorNode),
 }
 
-/// A private error node is used when other internal APIs require infaillible methods
+/// A private error node is used when other internal APIs require infallible methods
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ErrorNode {
     pub(crate) error: PstConstructionError,
@@ -551,6 +729,85 @@ impl Expr {
             _ => return Err(error_body::UnknownFunctionError::new(name).into()),
         })
     }
+
+    // === Expression reduction functions ===
+
+    /// Recursively accumulate a value over this expression tree.
+    ///
+    /// At each node, `f` is called first. If it returns `Some(t)`, that value is returned
+    /// immediately without recursing into children. Otherwise, the results of recursing into
+    /// all child expressions are merged pairwise with `op`. If a node has no children,
+    /// `zero` is returned.
+    pub fn reduce<T: Clone + Sized>(
+        &self,
+        f: &dyn Fn(&Self) -> Option<T>,
+        op: &dyn Fn(T, T) -> T,
+        zero: T,
+    ) -> T {
+        if let Some(t) = f(self) {
+            return t;
+        }
+        let recurse = |e: &Arc<Self>| e.reduce(f, op, zero.clone());
+        match self {
+            Expr::Literal(_)
+            | Expr::Var(_)
+            | Expr::Slot(_)
+            | Expr::Unknown { .. }
+            | Expr::Error(_) => zero,
+            Expr::UnaryOp { expr, .. }
+            | Expr::GetAttr { expr, .. }
+            | Expr::HasAttr { expr, .. }
+            | Expr::Like { expr, .. } => recurse(expr),
+            Expr::BinaryOp { left, right, .. } => op(recurse(left), recurse(right)),
+            Expr::Is { expr, in_expr, .. } => match in_expr {
+                Some(e) => op(recurse(expr), recurse(e)),
+                None => recurse(expr),
+            },
+            Expr::IfThenElse {
+                cond,
+                then_expr,
+                else_expr,
+            } => op(op(recurse(cond), recurse(then_expr)), recurse(else_expr)),
+            Expr::Set(exprs) => {
+                let mut iter = exprs.iter();
+                match iter.next() {
+                    None => zero,
+                    Some(first) => iter.fold(recurse(first), |acc, e| op(acc, recurse(e))),
+                }
+            }
+            Expr::Record(map) => {
+                let mut iter = map.values();
+                match iter.next() {
+                    None => zero,
+                    Some(first) => iter.fold(recurse(first), |acc, e| op(acc, recurse(e))),
+                }
+            }
+        }
+    }
+
+    /// Does this expression contain any slots?
+    pub fn has_slots(&self) -> bool {
+        self.reduce::<bool>(
+            &|e| match e {
+                Expr::Slot(_) => Some(true),
+                _ => None,
+            },
+            &|a, b| a || b,
+            false,
+        )
+    }
+
+    /// Return the slots used in this expression
+    pub fn slots(&self) -> HashSet<SlotId> {
+        self.reduce::<HashSet<SlotId>>(
+            &|e| match e {
+                Expr::Slot(id) => Some(HashSet::from([*id])),
+                _ => None,
+            },
+            &|a, b| a.union(&b).copied().collect(),
+            HashSet::new(),
+        )
+    }
 }
 
 /// Builder to construct a PST [`Expr`] that implements the [`ExprBuilder`] interface. Unlike the
@@ -562,6 +819,7 @@ pub(crate) struct PstBuilder;
 impl ExprBuilder for PstBuilder {
     type Expr = Expr;
     type Data = ();
+    type BuildError = PstConstructionError;
 
     #[cfg(feature = "tolerant-ast")]
     type ErrorType = crate::parser::err::ParseErrors;
@@ -599,11 +857,11 @@ impl ExprBuilder for PstBuilder {
         Expr::Slot(s.into())
     }
 
-    fn ite(self, test_expr: Expr, then_expr: Expr, else_expr: Expr) -> Expr {
+    fn ite_arc(self, cond: Arc<Expr>, then_expr: Arc<Expr>, else_expr: Arc<Expr>) -> Expr {
         Expr::IfThenElse {
-            cond: Arc::new(test_expr),
-            then_expr: Arc::new(then_expr),
-            else_expr: Arc::new(else_expr),
+            cond,
+            then_expr,
+            else_expr,
         }
     }
 
@@ -617,6 +875,14 @@ impl ExprBuilder for PstBuilder {
     fn is_eq(self, e1: Expr, e2: Expr) -> Expr {
         Expr::BinaryOp {
             op: BinaryOp::Eq,
+            left: Arc::new(e1),
+            right: Arc::new(e2),
+        }
+    }
+
+    fn noteq(self, e1: Expr, e2: Expr) -> Expr {
+        Expr::BinaryOp {
+            op: BinaryOp::NotEq,
             left: Arc::new(e1),
             right: Arc::new(e2),
         }
@@ -654,6 +920,22 @@ impl ExprBuilder for PstBuilder {
         }
     }
 
+    fn greater(self, e1: Expr, e2: Expr) -> Expr {
+        Expr::BinaryOp {
+            op: BinaryOp::Greater,
+            left: Arc::new(e1),
+            right: Arc::new(e2),
+        }
+    }
+
+    fn greatereq(self, e1: Expr, e2: Expr) -> Expr {
+        Expr::BinaryOp {
+            op: BinaryOp::GreaterEq,
+            left: Arc::new(e1),
+            right: Arc::new(e2),
+        }
+    }
+
     fn add(self, e1: Expr, e2: Expr) -> Expr {
         Expr::BinaryOp {
             op: BinaryOp::Add,
@@ -685,11 +967,11 @@ impl ExprBuilder for PstBuilder {
         }
     }
 
-    fn is_in(self, e1: Expr, e2: Expr) -> Expr {
+    fn is_in_arc(self, left: Arc<Expr>, right: Arc<Expr>) -> Expr {
         Expr::BinaryOp {
             op: BinaryOp::In,
-            left: Arc::new(e1),
-            right: Arc::new(e2),
+            left,
+            right,
         }
     }
 
@@ -772,18 +1054,27 @@ impl ExprBuilder for PstBuilder {
         }
     }
 
-    fn get_attr(self, expr: Expr, attr: SmolStr) -> Expr {
-        Expr::GetAttr {
-            expr: Arc::new(expr),
-            attr,
+    fn try_call_extension_fn(
+        self,
+        fn_name: ast::Name,
+        args: Vec<Expr>,
+    ) -> Result<Expr, PstConstructionError> {
+        Expr::from_function_ast_name_and_args(&fn_name, args.into_iter().map(Arc::new).collect())
+    }
+
+    fn get_attr_arc(self, expr: Arc<Expr>, attr: SmolStr) -> Expr {
+        Expr::GetAttr { expr, attr }
+    }
+
+    fn has_attr_arc(self, expr: Arc<Expr>, attr: SmolStr) -> Expr {
+        Expr::HasAttr {
+            expr,
+            attrs: nonempty::nonempty![attr],
         }
     }
 
-    fn has_attr(self, expr: Expr, attr: SmolStr) -> Expr {
-        Expr::HasAttr {
-            expr: Arc::new(expr),
-            attrs: nonempty::nonempty![attr],
-        }
+    fn extended_has_attr_arc(self, expr: Arc<Expr>, attrs: nonempty::NonEmpty<SmolStr>) -> Expr {
+        Expr::HasAttr { expr, attrs }
     }
 
     fn like(self, expr: Expr, pattern: ast::Pattern) -> Expr {
@@ -793,9 +1084,9 @@ impl ExprBuilder for PstBuilder {
         }
     }
 
-    fn is_entity_type(self, expr: Expr, entity_type: ast::EntityType) -> Expr {
+    fn is_entity_type_arc(self, expr: Arc<Expr>, entity_type: ast::EntityType) -> Expr {
         Expr::Is {
-            expr: Arc::new(expr),
+            expr,
             entity_type: entity_type.into(),
             in_expr: None,
         }
@@ -917,6 +1208,45 @@ impl std::fmt::Display for Expr {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[test]
+    fn test_has_slots() {
+        // Leaf with no slot
+        assert!(!Expr::Literal(Literal::Long(1)).has_slots());
+        // Var has no slot
+        assert!(!Expr::Var(Var::Principal).has_slots());
+        // Slot itself
+        assert!(Expr::Slot(SlotId::Principal).has_slots());
+        assert!(Expr::Slot(SlotId::Resource).has_slots());
+        // Slot nested inside a BinaryOp
+        let slot = Arc::new(Expr::Slot(SlotId::Principal));
+        let lit = Arc::new(Expr::Literal(Literal::Long(42)));
+        let binop = Expr::BinaryOp {
+            op: BinaryOp::Eq,
+            left: slot,
+            right: lit.clone(),
+        };
+        assert!(binop.has_slots());
+        // BinaryOp with no slots
+        let binop_no_slot = Expr::BinaryOp {
+            op: BinaryOp::Eq,
+            left: lit.clone(),
+            right: lit.clone(),
+        };
+        assert!(!binop_no_slot.has_slots());
+        // Slot nested inside a Set
+        let set_with_slot = Expr::Set(vec![lit.clone(), Arc::new(Expr::Slot(SlotId::Resource))]);
+        assert!(set_with_slot.has_slots());
+        // Empty set
+        assert!(!Expr::Set(vec![]).has_slots());
+        // IfThenElse with slot in else branch
+        let ite = Expr::IfThenElse {
+            cond: lit.clone(),
+            then_expr: lit.clone(),
+            else_expr: Arc::new(Expr::Slot(SlotId::Principal)),
+        };
+        assert!(ite.has_slots());
+    }
 
     #[test]
     fn test_from_function_unknown_function() {
@@ -1116,7 +1446,7 @@ mod tests {
                 ),
                 (
                     builder().noteq(builder().val(1i64), builder().val(2i64)),
-                    "!((1 == 2))",
+                    "(1 != 2)",
                 ),
                 (
                     builder().less(builder().val(1i64), builder().val(2i64)),
@@ -1128,11 +1458,11 @@ mod tests {
                 ),
                 (
                     builder().greater(builder().val(1i64), builder().val(2i64)),
-                    "!((1 <= 2))",
+                    "(1 > 2)",
                 ),
                 (
                     builder().greatereq(builder().val(1i64), builder().val(2i64)),
-                    "!((1 < 2))",
+                    "(1 >= 2)",
                 ),
                 // Binary ops - logical
                 (
@@ -1297,7 +1627,7 @@ mod tests {
             );
             assert_eq!(
                 complex.to_string(),
-                "if !((principal.age <= 18)) then principal.name else \"unknown\""
+                "if (principal.age > 18) then principal.name else \"unknown\""
             );
 
             // isEmpty
