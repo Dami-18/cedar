@@ -24,6 +24,7 @@ use crate::ast::*;
 use crate::entities::Entities;
 use crate::evaluator::Evaluator;
 use crate::extensions::Extensions;
+use crate::poltree::PolTree;
 use itertools::{Either, Itertools};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -48,6 +49,16 @@ pub struct Authorizer {
     error_handling: ErrorHandling,
 }
 
+/// Prepared context for repeatedly authorizing requests against a fixed
+/// [`PolicySet`] and [`Entities`] store.
+#[derive(Debug)]
+pub struct TreeAuthorizer<'a> {
+    authorizer: &'a Authorizer,
+    pset: &'a PolicySet,
+    entities: Arc<Entities>,
+    poltree: PolTree,
+}
+
 /// Describes the possible Cedar error-handling modes.
 /// We currently only have one mode: [`ErrorHandling::Skip`].
 /// Other modes were debated during development, so this is here as an easy
@@ -66,6 +77,22 @@ impl Authorizer {
         Self {
             extensions: Extensions::all_available(), // set at compile time
             error_handling: Default::default(),
+        }
+    }
+
+    /// Build reusable authorization context for a fixed [`PolicySet`] and [`Entities`] store. The [`PolTree`] is built once and used further for each access request.
+    pub fn prepare<'a>(
+        &'a self,
+        pset: &'a PolicySet,
+        entities: &Entities,
+    ) -> TreeAuthorizer<'a> {
+        let entities = Arc::new(entities.clone());
+        let poltree = PolTree::from_policy_set_and_entities(pset, Arc::clone(&entities));
+        TreeAuthorizer {
+            authorizer: self,
+            pset,
+            entities,
+            poltree,
         }
     }
 
@@ -159,6 +186,23 @@ impl Authorizer {
             errors,
             Arc::new(q),
         )
+    }
+}
+
+impl<'a> TreeAuthorizer<'a> {
+    /// Need to update this function and add actual tree traversal logic to check the request
+    /// Authorize using the fixed prepared policy/entities context.
+    pub fn is_authorized(&self, q: Request) -> Response {
+        let (decision, diagnostics) = self.poltree.evaluate_request(&q, &self.entities);
+        Response {
+            decision,
+            diagnostics,
+        }
+    }
+    /// Partial-evaluation variant using the fixed prepared policy/entities context.
+    pub fn is_authorized_core(&self, q: Request) -> PartialResponse {
+        self.authorizer
+            .is_authorized_core(q, self.pset, self.entities.as_ref())
     }
 }
 
