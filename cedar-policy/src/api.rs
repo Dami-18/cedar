@@ -979,6 +979,12 @@ impl IntoIterator for Entities {
 #[derive(Debug, Clone, RefCast)]
 pub struct Authorizer(authorizer::Authorizer);
 
+/// Prepared authorizer context for repeated authorization against a fixed
+/// [`PolicySet`] and [`Entities`] store.
+/// Building this once allows subsequent requests to reuse internal indexing structures.
+#[derive(Debug)]
+pub struct TreeAuthorizer<'a>(authorizer::TreeAuthorizer<'a>);
+
 #[doc(hidden)] // because this converts to a private/internal type
 impl AsRef<authorizer::Authorizer> for Authorizer {
     fn as_ref(&self) -> &authorizer::Authorizer {
@@ -1051,6 +1057,15 @@ impl Authorizer {
     /// ```
     pub fn new() -> Self {
         Self(authorizer::Authorizer::new())
+    }
+
+    /// Build reusable authorization context for a fixed [`PolicySet`] and
+    /// [`Entities`] store.
+    ///
+    /// Use the returned [`TreeAuthorizer`] to evaluate many requests while
+    /// reusing one prebuilt tree.
+    pub fn prepare<'a>(&'a self, p: &'a PolicySet, e: &Entities) -> TreeAuthorizer<'a> {
+        TreeAuthorizer(self.0.prepare(&p.ast, &e.0))
     }
 
     /// Returns an authorization response for `r` with respect to the given
@@ -1126,6 +1141,20 @@ impl Authorizer {
             .0
             .is_authorized_core(query.0.clone(), &policy_set.ast, &entities.0);
         PartialResponse(response)
+    }
+}
+
+impl TreeAuthorizer<'_> {
+    /// Authorize a request using prepared authorization context.
+    pub fn is_authorized(&self, r: &Request) -> Response {
+        self.0.is_authorized(r.0.clone()).into()
+    }
+
+    /// Partial-evaluation variant using prepared context.
+    #[doc = include_str!("../experimental_warning.md")]
+    #[cfg(feature = "partial-eval")]
+    pub fn is_authorized_partial(&self, query: &Request) -> PartialResponse {
+        PartialResponse(self.0.is_authorized_core(query.0.clone()))
     }
 }
 
