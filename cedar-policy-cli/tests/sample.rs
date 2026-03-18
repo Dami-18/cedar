@@ -107,6 +107,7 @@ fn run_authorize_test_with_linked_policies(
         entities_file: entities_file.into(),
         verbose: true,
         timing: false,
+        use_poltree: false,
     };
     let output = authorize(&cmd);
     assert_eq!(exit_code, output, "{cmd:#?}",);
@@ -168,6 +169,7 @@ fn run_authorize_test_context(
         entities_file: entities_file.into(),
         verbose: true,
         timing: false,
+        use_poltree: false,
     };
     let output = authorize(&cmd);
     assert_eq!(exit_code, output, "{cmd:#?}",);
@@ -201,6 +203,7 @@ fn run_authorize_test_json(
         entities_file: entities_file.into(),
         verbose: true,
         timing: false,
+        use_poltree: false,
     };
     let output = authorize(&cmd);
     assert_eq!(exit_code, output, "{cmd:#?}",);
