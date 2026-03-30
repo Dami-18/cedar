@@ -21,16 +21,19 @@
 //! - Converting between PST and other representations (EST, AST)
 //! - Validating PST structure and semantics
 
+use crate::est;
 use miette::Diagnostic;
 use smol_str::ToSmolStr;
 use thiserror::Error;
-
-use crate::est;
 
 /// Errors that can occur during PST construction or conversion
 #[derive(Debug, Clone, PartialEq, Eq, Diagnostic, Error)]
 #[non_exhaustive]
 pub enum PstConstructionError {
+    /// Trying to construct an empty policy
+    #[error("empty policy")]
+    #[diagnostic(code(pst::empty_policy))]
+    EmptyPolicy,
     /// Action constraints cannot contain template slots
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -122,6 +125,13 @@ pub enum PstConstructionError {
     ContainsSlots(#[from] error_body::ContainsSlotError),
 }
 
+impl PstConstructionError {
+    /// Create an invalid conversion error with the given description.
+    pub fn invalid_conversion(description: impl Into<String>) -> Self {
+        Self::InvalidConversion(error_body::InvalidConversionError::new(description.into()))
+    }
+}
+
 #[doc(hidden)]
 impl From<est::FromJsonError> for PstConstructionError {
     fn from(err: est::FromJsonError) -> Self {
@@ -151,13 +161,21 @@ impl From<est::FromJsonError> for PstConstructionError {
     }
 }
 
+#[doc(hidden)]
+impl From<crate::parser::err::ParseErrors> for PstConstructionError {
+    fn from(value: crate::parser::err::ParseErrors) -> Self {
+        error_body::ParsingFailedError::from(value).into()
+    }
+}
+
 /// Error subtypes for [`PstConstructionError`]
 pub mod error_body {
-    use std::collections::HashSet;
-
+    use crate::est;
     use crate::extensions::ExtensionFunctionLookupError;
+    use crate::pst::SlotId;
     use miette::Diagnostic;
     use smol_str::SmolStr;
+    use std::collections::HashSet;
     use thiserror::Error;
 
     /// Action constraints cannot contain template slots
@@ -310,6 +328,7 @@ pub mod error_body {
     }
 
     impl InvalidConversionError {
+        /// Create a new `InvalidConversionError` with the given description
         pub(crate) fn new(description: String) -> Self {
             Self { description }
         }
@@ -353,8 +372,16 @@ pub mod error_body {
         #[error("failed to link template: no value provided for `{slot}`")]
         MissedSlot {
             /// Slot which didn't have a value provided for it
-            slot: crate::pst::SlotId,
+            slot: SlotId,
         },
+    }
+
+    impl From<LinkingError> for est::LinkingError {
+        fn from(err: LinkingError) -> Self {
+            match err {
+                LinkingError::MissedSlot { slot } => Self::MissedSlot { slot: slot.into() },
+            }
+        }
     }
 
     /// The policy or an expression contains slots

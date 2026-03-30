@@ -16,19 +16,20 @@
 
 //! Conversions between PST and AST types
 
-use smol_str::ToSmolStr;
-
 use super::{
     ActionConstraint, BinaryOp, Clause, Effect, EntityOrSlot, EntityType, EntityUID, Expr,
     LinkedPolicy, Literal, Name, PatternElem, Policy, PolicyID, PrincipalConstraint,
     PstConstructionError, ResourceConstraint, SlotId, StaticPolicy, Template, UnaryOp, Var,
 };
-use crate::ast;
+use crate::ast::IsInfallible;
+use crate::ast::{self, UnwrapInfallible};
 use crate::expr_builder;
+#[cfg(feature = "tolerant-ast")]
+use crate::pst::err::error_body::UnsupportedErrorNode;
 use crate::pst::err::error_body::{
     InvalidConversionError, InvalidExpressionError, ParsingFailedError,
 };
-use crate::pst::expr::{ErrorNode, PstBuilder};
+use crate::pst::expr::PstBuilder;
 use itertools::Itertools;
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -40,27 +41,38 @@ impl TryFrom<Policy> for ast::Policy {
 
     fn try_from(policy: Policy) -> Result<Self, Self::Error> {
         match policy {
-            Policy::Static(StaticPolicy { body }) => Ok(ast::Policy::new(
-                Arc::new(body.try_into()?),
-                Option::None,
-                HashMap::new(),
-            )),
-            Policy::Linked(LinkedPolicy {
-                body,
-                values,
-                instance_id,
-            }) => {
-                let ast_values: HashMap<ast::SlotId, ast::EntityUID> = values
-                    .into_iter()
-                    .map(|(k, v)| Ok((k.into(), ast::EntityUID::try_from(v)?)))
-                    .collect::<Result<_, PstConstructionError>>()?;
-                Ok(ast::Policy::new(
-                    Arc::new(Arc::unwrap_or_clone(body).try_into()?),
-                    Option::Some(instance_id.into()),
-                    ast_values,
-                ))
-            }
+            Policy::Static(static_policy) => static_policy.try_into(),
+            Policy::Linked(linked_policy) => linked_policy.try_into(),
         }
+    }
+}
+
+impl TryFrom<StaticPolicy> for ast::Policy {
+    type Error = PstConstructionError;
+
+    fn try_from(policy: StaticPolicy) -> Result<Self, Self::Error> {
+        Ok(ast::Policy::new(
+            Arc::new(policy.body.try_into()?),
+            Option::None,
+            HashMap::new(),
+        ))
+    }
+}
+
+impl TryFrom<LinkedPolicy> for ast::Policy {
+    type Error = PstConstructionError;
+
+    fn try_from(policy: LinkedPolicy) -> Result<Self, Self::Error> {
+        let ast_values: HashMap<ast::SlotId, ast::EntityUID> = policy
+            .values
+            .into_iter()
+            .map(|(k, v)| Ok((k.into(), ast::EntityUID::try_from(v)?)))
+            .collect::<Result<_, PstConstructionError>>()?;
+        Ok(ast::Policy::new(
+            Arc::new(Arc::unwrap_or_clone(policy.body).try_into()?),
+            Option::Some(policy.instance_id.into()),
+            ast_values,
+        ))
     }
 }
 
@@ -237,7 +249,10 @@ impl TryFrom<Expr> for ast::Expr {
 impl Expr {
     pub(crate) fn try_into_expr<B: expr_builder::ExprBuilder>(
         self,
-    ) -> Result<B::Expr, PstConstructionError> {
+    ) -> Result<B::Expr, PstConstructionError>
+    where
+        B::BuildError: IsInfallible, // we can change this as needed
+    {
         let builder = B::new();
         match self {
             Expr::Literal(lit) => match lit {
@@ -261,7 +276,9 @@ impl Expr {
                     UnaryOp::IsEmpty => builder.is_empty(inner),
                     // The other unary operators are extension functions.
                     _ => match op.to_name() {
-                        Some(fn_name) => builder.call_extension_fn(fn_name.clone(), vec![inner]),
+                        Some(fn_name) => builder
+                            .call_extension_fn(fn_name.clone(), vec![inner])
+                            .unwrap_infallible(),
                         // This should never occur!
                         None => Err(PstConstructionError::from(InvalidExpressionError::new(
                             format!("unknown unary operator: {}", op),
@@ -293,9 +310,9 @@ impl Expr {
                     BinaryOp::HasTag => builder.has_tag(left_ast, right_ast),
                     // The other binary operators are extensions
                     _ => match op.to_name() {
-                        Some(fn_name) => {
-                            builder.call_extension_fn(fn_name.clone(), vec![left_ast, right_ast])
-                        }
+                        Some(fn_name) => builder
+                            .call_extension_fn(fn_name.clone(), vec![left_ast, right_ast])
+                            .unwrap_infallible(),
                         // This should never occur!
                         None => Err(PstConstructionError::from(InvalidExpressionError::new(
                             format!("unknown binary operator: {}", op),
@@ -361,7 +378,6 @@ impl Expr {
                 name,
                 type_annotation: None,
             })),
-            Expr::Error(ErrorNode { error }) => Err(error),
         }
     }
 }
@@ -382,7 +398,7 @@ impl TryFrom<EntityUID> for ast::EntityUID {
 
     fn try_from(value: EntityUID) -> Result<Self, PstConstructionError> {
         let ast_et: ast::EntityType = value.ty.try_into()?;
-        let ast_eid = ast::Eid::new(value.eid.as_str());
+        let ast_eid = ast::Eid::new(value.eid);
         Ok(ast::EntityUID::from_components(ast_et, ast_eid, None))
     }
 }
@@ -439,7 +455,7 @@ impl From<ast::Name> for Name {
             namespace: Arc::new(
                 Arc::unwrap_or_clone(path)
                     .into_iter()
-                    .map(|id| id.to_smolstr())
+                    .map(|id| id.into_smolstr())
                     .collect(),
             ),
         }
@@ -472,6 +488,7 @@ impl From<ast::SlotId> for SlotId {
     }
 }
 
+#[doc(hidden)]
 impl From<SlotId> for ast::SlotId {
     fn from(slot: SlotId) -> Self {
         match slot {
@@ -518,9 +535,10 @@ impl From<ast::EntityUID> for EntityUID {
 }
 
 #[doc(hidden)]
-impl From<ast::Expr> for Expr {
-    fn from(ast_expr: ast::Expr) -> Self {
-        ast::Expr::into_expr::<PstBuilder>(ast_expr)
+impl TryFrom<ast::Expr> for Expr {
+    type Error = PstConstructionError;
+    fn try_from(ast_expr: ast::Expr) -> Result<Self, PstConstructionError> {
+        ast::Expr::try_into_expr::<PstBuilder>(ast_expr)
     }
 }
 
@@ -586,20 +604,21 @@ impl From<ast::ResourceConstraint> for ResourceConstraint {
 }
 
 #[doc(hidden)]
-impl From<ast::ActionConstraint> for ActionConstraint {
-    fn from(c: ast::ActionConstraint) -> Self {
+impl TryFrom<ast::ActionConstraint> for ActionConstraint {
+    type Error = PstConstructionError;
+    fn try_from(c: ast::ActionConstraint) -> Result<Self, PstConstructionError> {
         match c {
-            ast::ActionConstraint::Any => ActionConstraint::Any,
+            ast::ActionConstraint::Any => Ok(ActionConstraint::Any),
             ast::ActionConstraint::Eq(uid) => {
-                ActionConstraint::Eq(Arc::unwrap_or_clone(uid).into())
+                Ok(ActionConstraint::Eq(Arc::unwrap_or_clone(uid).into()))
             }
-            ast::ActionConstraint::In(uids) => ActionConstraint::In(
+            ast::ActionConstraint::In(uids) => Ok(ActionConstraint::In(
                 uids.into_iter()
                     .map(|uid| Arc::unwrap_or_clone(uid).into())
                     .collect(),
-            ),
+            )),
             #[cfg(feature = "tolerant-ast")]
-            ast::ActionConstraint::ErrorConstraint => ActionConstraint::Any,
+            ast::ActionConstraint::ErrorConstraint => Err((UnsupportedErrorNode {}).into()),
         }
     }
 }
@@ -620,14 +639,16 @@ impl TryFrom<ast::Template> for Template {
         ) = template
             .into_template_components_opt()
             .ok_or_else(|| InvalidConversionError::new("template contained errors".to_string()))?;
-        let id = PolicyID(id.to_smolstr());
+        let id = PolicyID(id.into_smolstr());
         let effect = effect.into();
         let principal = principal_constraint.into();
-        let action = action_constraint.into();
+        let action = action_constraint.try_into()?;
         let resource = resource_constraint.into();
 
         let clauses = match clause {
-            Some(expr) => vec![Clause::When(Arc::new(Arc::unwrap_or_clone(expr).into()))],
+            Some(expr) => vec![Clause::When(Arc::new(
+                Arc::unwrap_or_clone(expr).try_into()?,
+            ))],
             None => vec![],
         };
 
@@ -685,8 +706,11 @@ mod tests {
 
     /// Test roundtrip: ast::Expr -> pst::Expr -> ast::Expr
     fn assert_expr_roundtrip(ast_expr: ast::Expr) {
-        let pst_expr: Expr = ast_expr.clone().into();
-        let ast_expr2: ast::Expr = pst_expr.try_into().expect("conversion failed");
+        let pst_expr: Expr = ast_expr
+            .clone()
+            .try_into()
+            .expect("ast -> pst onversion failed.");
+        let ast_expr2: ast::Expr = pst_expr.try_into().expect("pst -> ast conversion failed");
         assert_eq!(ast_expr, ast_expr2, "roundtrip failed");
     }
 
@@ -881,7 +905,7 @@ mod tests {
         for (expr_str, desc) in cases {
             let ast_expr = parse_expr(expr_str);
             // Convert to PST
-            let pst_expr: Expr = ast_expr.into();
+            let pst_expr: Expr = ast_expr.try_into().unwrap();
             // Convert back to AST - should succeed even if structure differs
             let _ast_expr2: ast::Expr = pst_expr.try_into().expect(desc);
         }
@@ -912,7 +936,7 @@ mod tests {
         use crate::ast;
         let unknown = ast::Unknown::new_untyped("test");
         let ast_expr = ast::Expr::unknown(unknown);
-        let pst_expr: Expr = ast_expr.clone().into();
+        let pst_expr: Expr = ast_expr.clone().try_into().unwrap();
         let ast_expr2: ast::Expr = pst_expr.try_into().expect("conversion failed");
         assert_eq!(ast_expr, ast_expr2);
     }
@@ -944,9 +968,12 @@ mod tests {
     /// Test roundtrip: parse Cedar text -> ast::Template -> pst::Policy -> ast::Template
     /// and verify the string representation is preserved.
     fn assert_template_roundtrip(cedar_text: &str) {
-        let ast_template = parser::parse_template(None, cedar_text).expect("parse failed");
+        let ast_template =
+            parser::parse_template(Some(ast::PolicyID::from_string("id\n")), cedar_text)
+                .expect("parse failed");
         let pst_policy: Template = ast_template.clone().try_into().expect("ast->pst failed");
         let ast_template2: ast::Template = pst_policy.try_into().expect("pst->ast failed");
+        assert_eq!(ast_template.id(), ast_template2.id());
         assert_eq!(
             normalize(&ast_template.to_string()),
             normalize(&ast_template2.to_string()),
@@ -1057,7 +1084,7 @@ mod tests {
 
         for (input, expected_output, desc) in cases {
             let ast_expr = parse_expr(input);
-            let pst_expr: Expr = ast_expr.into();
+            let pst_expr: Expr = ast_expr.try_into().unwrap();
             let ast_expr2: ast::Expr = pst_expr.try_into().expect("conversion failed");
 
             // Normalize both for comparison
@@ -1074,28 +1101,6 @@ mod tests {
                 .join(" ");
 
             assert_eq!(actual, expected, "failed: {}", desc);
-        }
-    }
-
-    /// Test that ErrorNode in PST results in conversion error
-    #[test]
-    fn test_error_node_conversion() {
-        use crate::pst::expr::ErrorNode;
-
-        let error_expr = Expr::Error(ErrorNode {
-            error: InvalidExpressionError::new("test error".into()).into(),
-        });
-
-        let result: Result<ast::Expr, PstConstructionError> = error_expr.try_into();
-        assert!(result.is_err(), "ErrorNode should fail conversion");
-
-        match result {
-            Err(PstConstructionError::InvalidExpression(err)) => {
-                assert_eq!(err.description, "test error");
-                println!("✓ ErrorNode correctly produces conversion error");
-            }
-            Err(e) => panic!("Expected InvalidExpression error, got: {:?}", e),
-            Ok(_) => panic!("Expected error, got Ok"),
         }
     }
 }

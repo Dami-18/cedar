@@ -11274,3 +11274,1193 @@ mod has_non_scope_constraint {
         assert!(roundtrip_via_policy_set(p).has_non_scope_constraint());
     }
 }
+
+mod pst_api {
+    use super::super::super::*;
+    use std::collections::{BTreeMap, HashMap};
+    use std::str::FromStr;
+    use std::sync::Arc;
+
+    /// Helper: build a PST template with a ?principal slot and a when clause
+    fn pst_template_with_slot() -> pst::Template {
+        pst::Template::new(
+            "t1",
+            pst::Effect::Permit,
+            pst::PrincipalConstraint::Eq(pst::EntityOrSlot::Slot(pst::SlotId::Principal)),
+            pst::ActionConstraint::Any,
+            pst::ResourceConstraint::Any,
+        )
+        .try_with_clauses([pst::Clause::When(Arc::new(pst::Expr::BinaryOp {
+            op: pst::BinaryOp::Eq,
+            left: Arc::new(pst::Expr::Var(pst::Var::Context)),
+            right: Arc::new(pst::Expr::Record(Default::default())),
+        }))])
+        .unwrap()
+    }
+
+    /// Helper: build a static PST template (no slots) with when and unless clauses
+    fn pst_static_template() -> pst::Template {
+        pst::Template::new(
+            "p1",
+            pst::Effect::Permit,
+            pst::PrincipalConstraint::Any,
+            pst::ActionConstraint::Any,
+            pst::ResourceConstraint::Any,
+        )
+        .try_with_clauses([
+            pst::Clause::When(Arc::new(pst::Expr::Literal(pst::Literal::Bool(true)))),
+            pst::Clause::Unless(Arc::new(pst::Expr::Literal(pst::Literal::Bool(false)))),
+        ])
+        .unwrap()
+    }
+
+    // --- Template::from_pst ---
+
+    #[test]
+    fn template_from_pst_with_slots() {
+        let t = Template::from_pst(pst_template_with_slot()).expect("should succeed");
+        assert_eq!(t.id().to_string(), "t1");
+        assert!(t.slots().any(|s| *s == SlotId::principal()));
+        // other representations
+        assert!(t.to_cedar().contains("?principal"));
+        t.to_json().expect("json should succeed");
+    }
+
+    #[test]
+    fn template_from_pst_rejects_static() {
+        let err = Template::from_pst(pst_static_template()).unwrap_err();
+        assert!(err.to_string().contains("static policy"));
+    }
+
+    // --- Template::to_pst / try_into_pst ---
+
+    #[test]
+    fn template_to_pst_roundtrip() {
+        let original = pst_template_with_slot();
+        let t = Template::from_pst(original.clone()).unwrap();
+        let recovered = t.to_pst().expect("should succeed");
+        assert_eq!(format!("{recovered}"), format!("{original}"));
+    }
+
+    #[test]
+    fn template_try_into_pst_roundtrip() {
+        let original = pst_template_with_slot();
+        let t = Template::from_pst(original.clone()).unwrap();
+        let recovered = t.try_into_pst().expect("should succeed");
+        assert_eq!(format!("{recovered}"), format!("{original}"));
+    }
+
+    #[test]
+    fn template_parsed_to_pst() {
+        let src = "permit(principal == ?principal, action, resource) when { context.x > 5 };";
+        let t = Template::parse(None, src).unwrap();
+        let pst = t.to_pst().expect("to_pst should succeed");
+        assert!(pst.principal.has_slot());
+        assert_eq!(pst.clauses().len(), 1);
+        assert!(matches!(pst.clauses()[0], pst::Clause::When(_)));
+        // also test try_into_pst
+        let t2 = Template::parse(None, src).unwrap();
+        let pst2 = t2.try_into_pst().expect("try_into_pst should succeed");
+        assert!(pst2.principal.has_slot());
+    }
+
+    // --- Policy::from_pst (static) ---
+
+    #[test]
+    fn policy_from_pst_static() {
+        let sp = pst::StaticPolicy::try_from(pst_static_template()).unwrap();
+        let p = Policy::from_pst(sp.into()).expect("should succeed");
+        assert_eq!(p.id().to_string(), "p1");
+        assert!(p.is_static());
+        // other representations
+        let cedar = p.to_cedar().unwrap();
+        assert!(cedar.contains("permit"));
+        assert!(cedar.contains("when"));
+        p.to_json().expect("json should succeed");
+    }
+
+    // --- Policy::from_pst (linked) ---
+
+    #[test]
+    fn policy_from_pst_linked() {
+        let template = Arc::new(pst_template_with_slot());
+        let uid = pst::EntityUID {
+            ty: pst::EntityType::from_name(pst::Name::unqualified("User")),
+            eid: "alice".into(),
+        };
+        let linked = pst::LinkedPolicy::new(
+            template,
+            HashMap::from([(pst::SlotId::Principal, uid)]),
+            "link1".into(),
+        )
+        .unwrap();
+        let p = Policy::from_pst(linked.into()).expect("should succeed");
+        assert!(!p.is_static());
+        assert_eq!(p.template_id().unwrap().to_string(), "t1");
+        // other representations
+        p.to_json().expect("json should succeed");
+    }
+
+    // --- Policy::to_pst / try_into_pst ---
+
+    #[test]
+    fn policy_to_pst_roundtrip() {
+        let sp = pst::StaticPolicy::try_from(pst_static_template()).unwrap();
+        let p = Policy::from_pst(sp.into()).unwrap();
+        let recovered = p.to_pst().expect("should succeed");
+        assert!(matches!(recovered, pst::Policy::Static(_)));
+    }
+
+    #[test]
+    fn policy_try_into_pst_roundtrip() {
+        let sp = pst::StaticPolicy::try_from(pst_static_template()).unwrap();
+        let p = Policy::from_pst(sp.into()).unwrap();
+        let recovered = p.try_into_pst().expect("should succeed");
+        assert!(matches!(recovered, pst::Policy::Static(_)));
+    }
+
+    #[test]
+    fn policy_empty_to_pst_with_valid_ast() {
+        let non_empty_ast = Template::from_pst(pst_template_with_slot()).unwrap().ast;
+        let p = Template {
+            lossless: LosslessTemplate::Empty,
+            ast: non_empty_ast,
+        };
+        assert_eq!(
+            p.clone().to_pst().unwrap().to_string(),
+            pst_template_with_slot().to_string()
+        );
+        assert_eq!(
+            p.try_into_pst().unwrap_err(),
+            pst::PstConstructionError::EmptyPolicy
+        )
+    }
+
+    #[test]
+    fn policy_parsed_to_pst() {
+        let src = r#"permit(principal, action, resource) when { context.x > 5 } unless { resource == User::"bob" };"#;
+        let p: Policy = src.parse().unwrap();
+        let pst = p.to_pst().expect("to_pst should succeed");
+        assert!(matches!(&pst, pst::Policy::Static(_)));
+        if let pst::Policy::Static(sp) = &pst {
+            assert_eq!(sp.body.clauses().len(), 2);
+            assert!(matches!(sp.body.clauses()[0], pst::Clause::When(_)));
+            assert!(matches!(sp.body.clauses()[1], pst::Clause::Unless(_)));
+        }
+        // also test try_into_pst
+        let p2: Policy = src.parse().unwrap();
+        let pst2 = p2.try_into_pst().expect("try_into_pst should succeed");
+        assert!(matches!(pst2, pst::Policy::Static(_)));
+    }
+
+    // --- Text → Template → PST → other representations ---
+
+    #[test]
+    fn text_template_pst_cross_repr() {
+        let src = "forbid(principal == ?principal, action, resource) when { context.admin };";
+        let t = Template::parse(Some(PolicyId::new("tmpl")), src).unwrap();
+        // text → PST (to_pst)
+        let pst = t.to_pst().expect("to_pst should succeed");
+        assert!(pst.principal.has_slot());
+        assert_eq!(pst.effect, pst::Effect::Forbid);
+        assert_eq!(pst.clauses().len(), 1);
+        // PST → Template → other representations
+        let t2 = Template::from_pst(pst).unwrap();
+        assert!(t2.to_cedar().contains("?principal"));
+        t2.to_json().expect("json should succeed");
+        // text → PST (try_into_pst)
+        let t3 = Template::parse(Some(PolicyId::new("tmpl")), src).unwrap();
+        let pst2 = t3.try_into_pst().expect("try_into_pst should succeed");
+        assert!(pst2.principal.has_slot());
+    }
+
+    // --- Text → Policy → PST → other representations ---
+
+    #[test]
+    fn text_policy_pst_cross_repr() {
+        let src = r#"forbid(principal, action == Action::"delete", resource) unless { principal.admin };"#;
+        let p: Policy = src.parse().unwrap();
+        // text → PST (to_pst)
+        let pst = p.to_pst().expect("to_pst should succeed");
+        if let pst::Policy::Static(sp) = &pst {
+            assert_eq!(sp.body.effect, pst::Effect::Forbid);
+            assert!(matches!(sp.body.action, pst::ActionConstraint::Eq(_)));
+            assert_eq!(sp.body.clauses().len(), 1);
+        } else {
+            panic!("expected static policy");
+        }
+        // PST → Policy → other representations
+        let p2 = Policy::from_pst(pst).unwrap();
+        let cedar = p2.to_cedar().unwrap();
+        assert!(cedar.contains("forbid"));
+        assert!(cedar.contains("Action::\"delete\""));
+        p2.to_json().expect("json should succeed");
+        // text → PST (try_into_pst)
+        let p3: Policy = src.parse().unwrap();
+        let pst2 = p3.try_into_pst().expect("try_into_pst should succeed");
+        assert!(matches!(pst2, pst::Policy::Static(_)));
+    }
+
+    // --- EST → PST ---
+
+    #[test]
+    fn est_policy_to_pst() {
+        let json = serde_json::json!({
+            "effect": "forbid",
+            "principal": { "op": "All" },
+            "action": { "op": "All" },
+            "resource": { "op": "All" },
+            "conditions": [{ "kind": "when", "body": { "==": { "left": { "Var": "context" }, "right": { "Record": {} } } } }]
+        });
+        let p = Policy::from_json(None, json.clone()).unwrap();
+        let pst = p.to_pst().expect("to_pst should succeed");
+        if let pst::Policy::Static(sp) = &pst {
+            assert_eq!(sp.body.effect, pst::Effect::Forbid);
+            assert_eq!(sp.body.clauses().len(), 1);
+        } else {
+            panic!("expected static");
+        }
+        // also test try_into_pst
+        let p2 = Policy::from_json(None, json).unwrap();
+        let pst2 = p2.try_into_pst().expect("try_into_pst should succeed");
+        assert!(matches!(pst2, pst::Policy::Static(_)));
+    }
+
+    #[test]
+    fn est_template_to_pst() {
+        let json = serde_json::json!({
+            "effect": "permit",
+            "principal": { "op": "==", "slot": "?principal" },
+            "action": { "op": "All" },
+            "resource": { "op": "All" },
+            "conditions": [{ "kind": "unless", "body": { "Var": "context" } }]
+        });
+        let t = Template::from_json(None, json.clone()).unwrap();
+        let pst = t.to_pst().expect("to_pst should succeed");
+        assert!(pst.principal.has_slot());
+        assert_eq!(pst.clauses().len(), 1);
+        assert!(matches!(pst.clauses()[0], pst::Clause::Unless(_)));
+        // also test try_into_pst
+        let t2 = Template::from_json(None, json).unwrap();
+        let pst2 = t2.try_into_pst().expect("try_into_pst should succeed");
+        assert!(pst2.principal.has_slot());
+    }
+
+    // --- LinkedPolicy::new ---
+
+    #[test]
+    fn linked_policy_new_missing_slot() {
+        let template = Arc::new(pst_template_with_slot());
+        let err = pst::LinkedPolicy::new(template, HashMap::new(), "link1".into()).unwrap_err();
+        assert!(err.to_string().contains("no value provided for"));
+    }
+
+    // --- PolicySet::link with PST-backed template ---
+
+    #[test]
+    fn policy_set_link_pst_template() {
+        let t = Template::from_pst(pst_template_with_slot()).unwrap();
+        let mut pset = PolicySet::new();
+        pset.add_template(t).unwrap();
+        let uid =
+            EntityUid::from_type_name_and_id("User".parse().unwrap(), "alice".parse().unwrap());
+        pset.link(
+            PolicyId::new("t1"),
+            PolicyId::new("link1"),
+            HashMap::from([(SlotId::principal(), uid)]),
+        )
+        .unwrap();
+        let linked = pset.policy(&PolicyId::new("link1")).unwrap();
+        let pst = linked.to_pst().expect("to_pst should succeed");
+        assert!(matches!(pst, pst::Policy::Linked(_)));
+        // also test try_into_pst
+        let pst2 = linked
+            .clone()
+            .try_into_pst()
+            .expect("try_into_pst should succeed");
+        assert!(matches!(pst2, pst::Policy::Linked(_)));
+    }
+
+    // ===== PolicySet PST tests =====
+
+    fn uid(ty: &str, eid: &str) -> pst::EntityUID {
+        pst::EntityUID {
+            ty: pst::EntityType::from_name(pst::Name::unqualified(ty)),
+            eid: eid.into(),
+        }
+    }
+
+    fn action_uid(eid: &str) -> pst::EntityUID {
+        pst::EntityUID {
+            ty: pst::EntityType::from_name(pst::Name::unqualified("Action")),
+            eid: eid.into(),
+        }
+    }
+
+    fn when_true() -> pst::Clause {
+        pst::Clause::When(Arc::new(pst::Expr::Literal(pst::Literal::Bool(true))))
+    }
+
+    fn unless_false() -> pst::Clause {
+        pst::Clause::Unless(Arc::new(pst::Expr::Literal(pst::Literal::Bool(false))))
+    }
+
+    /// Build a static template (no slots) with the given constraints and clauses.
+    fn static_template(
+        id: &str,
+        effect: pst::Effect,
+        principal: pst::PrincipalConstraint,
+        action: pst::ActionConstraint,
+        resource: pst::ResourceConstraint,
+        clauses: Vec<pst::Clause>,
+    ) -> pst::Template {
+        pst::Template::new(id, effect, principal, action, resource)
+            .try_with_clauses(clauses)
+            .unwrap()
+    }
+
+    /// Build a template with slots.
+    fn slotted_template(
+        id: &str,
+        effect: pst::Effect,
+        principal: pst::PrincipalConstraint,
+        action: pst::ActionConstraint,
+        resource: pst::ResourceConstraint,
+        clauses: Vec<pst::Clause>,
+    ) -> pst::Template {
+        pst::Template::new(id, effect, principal, action, resource)
+            .try_with_clauses(clauses)
+            .unwrap()
+    }
+
+    /// Assert two PST PolicySets are structurally equal.
+    fn assert_pst_sets_eq(a: &pst::PolicySet, b: &pst::PolicySet, label: &str) {
+        // Templates
+        let a_tkeys: Vec<_> = a.templates.keys().collect();
+        let b_tkeys: Vec<_> = b.templates.keys().collect();
+        assert_eq!(a_tkeys, b_tkeys, "{label}: template keys differ");
+        for (k, at) in &a.templates {
+            let bt = &b.templates[k];
+            assert_eq!(at, bt, "{label}: template '{k}' differs");
+        }
+        // Static policies
+        let a_pkeys: Vec<_> = a.policies.keys().collect();
+        let b_pkeys: Vec<_> = b.policies.keys().collect();
+        assert_eq!(a_pkeys, b_pkeys, "{label}: policy keys differ");
+        for (k, ap) in &a.policies {
+            let bp = &b.policies[k];
+            assert_eq!(ap.body, bp.body, "{label}: policy '{k}' body differs");
+        }
+        // Template links
+        assert_eq!(
+            a.template_links.len(),
+            b.template_links.len(),
+            "{label}: template_links count differs"
+        );
+        for (al, bl) in a.template_links.iter().zip(&b.template_links) {
+            assert_eq!(
+                al.template_id, bl.template_id,
+                "{label}: link template_id differs"
+            );
+            assert_eq!(al.new_id, bl.new_id, "{label}: link new_id differs");
+            assert_eq!(al.values, bl.values, "{label}: link values differ");
+        }
+    }
+
+    /// Generate a collection of named PST PolicySets covering many variants.
+    fn policy_set_test_cases() -> Vec<(&'static str, pst::PolicySet)> {
+        use linked_hash_map::LinkedHashMap;
+        use pst::*;
+
+        let mut cases: Vec<(&str, PolicySet)> = Vec::new();
+
+        // 1. Empty
+        cases.push((
+            "empty",
+            PolicySet {
+                templates: LinkedHashMap::new(),
+                policies: LinkedHashMap::new(),
+                template_links: vec![],
+            },
+        ));
+
+        // 2-8. Static policies with various constraint combinations
+        let constraint_variants: Vec<(
+            &str,
+            PrincipalConstraint,
+            ActionConstraint,
+            ResourceConstraint,
+            Vec<Clause>,
+        )> = vec![
+            (
+                "any_scope",
+                PrincipalConstraint::Any,
+                ActionConstraint::Any,
+                ResourceConstraint::Any,
+                vec![when_true()],
+            ),
+            (
+                "eq_principal",
+                PrincipalConstraint::Eq(EntityOrSlot::Entity(uid("User", "alice"))),
+                ActionConstraint::Eq(action_uid("view")),
+                ResourceConstraint::Any,
+                vec![when_true()],
+            ),
+            (
+                "in_resource",
+                PrincipalConstraint::Any,
+                ActionConstraint::In(vec![action_uid("read"), action_uid("list")]),
+                ResourceConstraint::In(EntityOrSlot::Entity(uid("Album", "vacation"))),
+                vec![when_true(), unless_false()],
+            ),
+            (
+                "is_principal",
+                PrincipalConstraint::Is(EntityType::from_name(Name::unqualified("User"))),
+                ActionConstraint::Any,
+                ResourceConstraint::Eq(EntityOrSlot::Entity(uid("Photo", "pic.jpg"))),
+                vec![],
+            ),
+            (
+                "is_in_resource",
+                PrincipalConstraint::Eq(EntityOrSlot::Entity(uid("User", "bob"))),
+                ActionConstraint::Any,
+                ResourceConstraint::IsIn(
+                    EntityType::from_name(Name::unqualified("Photo")),
+                    EntityOrSlot::Entity(uid("Album", "shared")),
+                ),
+                vec![when_true()],
+            ),
+            (
+                "forbid_policy",
+                PrincipalConstraint::Any,
+                ActionConstraint::Eq(action_uid("delete")),
+                ResourceConstraint::Any,
+                vec![pst::Clause::Unless(Arc::new(pst::Expr::GetAttr {
+                    expr: Arc::new(pst::Expr::Var(pst::Var::Principal)),
+                    attr: "admin".into(),
+                }))],
+            ),
+        ];
+
+        for (name, pc, ac, rc, clauses) in &constraint_variants {
+            let effect = if *name == "forbid_policy" {
+                Effect::Forbid
+            } else {
+                Effect::Permit
+            };
+            let sp = StaticPolicy::try_from(static_template(
+                name,
+                effect,
+                pc.clone(),
+                ac.clone(),
+                rc.clone(),
+                clauses.clone(),
+            ))
+            .unwrap();
+            let mut policies = LinkedHashMap::new();
+            policies.insert(PolicyID((*name).into()), sp);
+            cases.push((
+                name,
+                PolicySet {
+                    templates: LinkedHashMap::new(),
+                    policies,
+                    template_links: vec![],
+                },
+            ));
+        }
+
+        // 9. Multiple static policies
+        {
+            let mut policies = LinkedHashMap::new();
+            for (name, pc, ac, rc, clauses) in &constraint_variants[..3] {
+                let sp = StaticPolicy::try_from(static_template(
+                    name,
+                    Effect::Permit,
+                    pc.clone(),
+                    ac.clone(),
+                    rc.clone(),
+                    clauses.clone(),
+                ))
+                .unwrap();
+                policies.insert(PolicyID((*name).into()), sp);
+            }
+            cases.push((
+                "multiple_static",
+                PolicySet {
+                    templates: LinkedHashMap::new(),
+                    policies,
+                    template_links: vec![],
+                },
+            ));
+        }
+
+        // 10. Template with ?principal slot only
+        {
+            let t = slotted_template(
+                "tmpl_principal",
+                Effect::Permit,
+                PrincipalConstraint::Eq(EntityOrSlot::Slot(SlotId::Principal)),
+                ActionConstraint::Eq(action_uid("view")),
+                ResourceConstraint::Any,
+                vec![when_true()],
+            );
+            let mut templates = LinkedHashMap::new();
+            templates.insert(PolicyID("tmpl_principal".into()), t);
+            cases.push((
+                "template_principal_slot",
+                PolicySet {
+                    templates,
+                    policies: LinkedHashMap::new(),
+                    template_links: vec![],
+                },
+            ));
+        }
+
+        // 11. Template with ?resource slot only
+        {
+            let t = slotted_template(
+                "tmpl_resource",
+                Effect::Forbid,
+                PrincipalConstraint::Is(EntityType::from_name(Name::unqualified("User"))),
+                ActionConstraint::Any,
+                ResourceConstraint::In(EntityOrSlot::Slot(SlotId::Resource)),
+                vec![unless_false()],
+            );
+            let mut templates = LinkedHashMap::new();
+            templates.insert(PolicyID("tmpl_resource".into()), t);
+            cases.push((
+                "template_resource_slot",
+                PolicySet {
+                    templates,
+                    policies: LinkedHashMap::new(),
+                    template_links: vec![],
+                },
+            ));
+        }
+
+        // 12. Template with both slots
+        {
+            let t = slotted_template(
+                "tmpl_both",
+                Effect::Permit,
+                PrincipalConstraint::In(EntityOrSlot::Slot(SlotId::Principal)),
+                ActionConstraint::Any,
+                ResourceConstraint::Eq(EntityOrSlot::Slot(SlotId::Resource)),
+                vec![],
+            );
+            let mut templates = LinkedHashMap::new();
+            templates.insert(PolicyID("tmpl_both".into()), t);
+            cases.push((
+                "template_both_slots",
+                PolicySet {
+                    templates,
+                    policies: LinkedHashMap::new(),
+                    template_links: vec![],
+                },
+            ));
+        }
+
+        // 13. Template + single link
+        {
+            let t = slotted_template(
+                "tmpl_link",
+                Effect::Permit,
+                PrincipalConstraint::Eq(EntityOrSlot::Slot(SlotId::Principal)),
+                ActionConstraint::Eq(action_uid("view")),
+                ResourceConstraint::Any,
+                vec![when_true()],
+            );
+            let mut templates = LinkedHashMap::new();
+            templates.insert(PolicyID("tmpl_link".into()), t);
+            cases.push((
+                "template_with_link",
+                PolicySet {
+                    templates,
+                    policies: LinkedHashMap::new(),
+                    template_links: vec![TemplateLink {
+                        template_id: PolicyID("tmpl_link".into()),
+                        new_id: PolicyID("link_alice".into()),
+                        values: HashMap::from([(SlotId::Principal, uid("User", "alice"))]),
+                    }],
+                },
+            ));
+        }
+
+        // 14. Template + multiple links
+        {
+            let t = slotted_template(
+                "tmpl_multi",
+                Effect::Forbid,
+                PrincipalConstraint::Eq(EntityOrSlot::Slot(SlotId::Principal)),
+                ActionConstraint::Eq(action_uid("delete")),
+                ResourceConstraint::Any,
+                vec![],
+            );
+            let mut templates = LinkedHashMap::new();
+            templates.insert(PolicyID("tmpl_multi".into()), t);
+            cases.push((
+                "template_multi_links",
+                PolicySet {
+                    templates,
+                    policies: LinkedHashMap::new(),
+                    template_links: vec![
+                        TemplateLink {
+                            template_id: PolicyID("tmpl_multi".into()),
+                            new_id: PolicyID("deny_alice".into()),
+                            values: HashMap::from([(SlotId::Principal, uid("User", "alice"))]),
+                        },
+                        TemplateLink {
+                            template_id: PolicyID("tmpl_multi".into()),
+                            new_id: PolicyID("deny_bob".into()),
+                            values: HashMap::from([(SlotId::Principal, uid("User", "bob"))]),
+                        },
+                    ],
+                },
+            ));
+        }
+
+        // 15. Full mix: templates + static policies + links
+        {
+            let t = slotted_template(
+                "access_tmpl",
+                Effect::Permit,
+                PrincipalConstraint::Eq(EntityOrSlot::Slot(SlotId::Principal)),
+                ActionConstraint::In(vec![action_uid("read"), action_uid("write")]),
+                ResourceConstraint::Any,
+                vec![when_true()],
+            );
+            let sp = StaticPolicy::try_from(static_template(
+                "admin_bypass",
+                Effect::Permit,
+                PrincipalConstraint::Is(EntityType::from_name(Name::unqualified("Admin"))),
+                ActionConstraint::Any,
+                ResourceConstraint::Any,
+                vec![],
+            ))
+            .unwrap();
+            let mut templates = LinkedHashMap::new();
+            templates.insert(PolicyID("access_tmpl".into()), t);
+            let mut policies = LinkedHashMap::new();
+            policies.insert(PolicyID("admin_bypass".into()), sp);
+            cases.push((
+                "full_mix",
+                PolicySet {
+                    templates,
+                    policies,
+                    template_links: vec![TemplateLink {
+                        template_id: PolicyID("access_tmpl".into()),
+                        new_id: PolicyID("alice_access".into()),
+                        values: HashMap::from([(SlotId::Principal, uid("User", "alice"))]),
+                    }],
+                },
+            ));
+        }
+
+        // 16. Static policy with annotations
+        {
+            let sp = StaticPolicy::try_from(
+                static_template(
+                    "annotated",
+                    Effect::Permit,
+                    PrincipalConstraint::Any,
+                    ActionConstraint::Any,
+                    ResourceConstraint::Any,
+                    vec![when_true()],
+                )
+                .with_annotations(BTreeMap::from([
+                    ("reason".to_string(), "testing".into()),
+                    ("id".to_string(), "annotated".into()),
+                ])),
+            )
+            .unwrap();
+            let mut policies = LinkedHashMap::new();
+            policies.insert(PolicyID("annotated".into()), sp);
+            cases.push((
+                "annotated_policy",
+                PolicySet {
+                    templates: LinkedHashMap::new(),
+                    policies,
+                    template_links: vec![],
+                },
+            ));
+        }
+
+        // 17. Template with both slots + link filling both
+        {
+            let t = slotted_template(
+                "tmpl_both_linked",
+                Effect::Permit,
+                PrincipalConstraint::Eq(EntityOrSlot::Slot(SlotId::Principal)),
+                ActionConstraint::Any,
+                ResourceConstraint::In(EntityOrSlot::Slot(SlotId::Resource)),
+                vec![when_true()],
+            );
+            let mut templates = LinkedHashMap::new();
+            templates.insert(PolicyID("tmpl_both_linked".into()), t);
+            cases.push((
+                "both_slots_linked",
+                PolicySet {
+                    templates,
+                    policies: LinkedHashMap::new(),
+                    template_links: vec![TemplateLink {
+                        template_id: PolicyID("tmpl_both_linked".into()),
+                        new_id: PolicyID("alice_photos".into()),
+                        values: HashMap::from([
+                            (SlotId::Principal, uid("User", "alice")),
+                            (SlotId::Resource, uid("Album", "vacation")),
+                        ]),
+                    }],
+                },
+            ));
+        }
+
+        cases
+    }
+
+    // --- PolicySet roundtrip: from_pst → to_pst ---
+
+    #[test]
+    fn policy_set_roundtrip_to_pst() {
+        for (name, pst_set) in policy_set_test_cases() {
+            let api_set =
+                PolicySet::from_pst(pst_set.clone()).unwrap_or_else(|e| panic!("{name}: {e}"));
+            // Verify counts match
+            assert_eq!(
+                api_set.templates().count(),
+                pst_set.templates.len(),
+                "{name}: template count"
+            );
+            assert_eq!(
+                api_set.policies().count(),
+                pst_set.policies.len() + pst_set.template_links.len(),
+                "{name}: policy count"
+            );
+            let recovered = api_set.to_pst().unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_pst_sets_eq(&pst_set, &recovered, name);
+        }
+    }
+
+    // --- PolicySet roundtrip: from_pst → try_into_pst ---
+
+    #[test]
+    fn policy_set_roundtrip_try_into_pst() {
+        for (name, pst_set) in policy_set_test_cases() {
+            let api_set =
+                PolicySet::from_pst(pst_set.clone()).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let recovered = api_set
+                .try_into_pst()
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_pst_sets_eq(&pst_set, &recovered, name);
+        }
+    }
+
+    // --- PolicySet from_pst: verify individual policy/template access ---
+
+    #[test]
+    fn policy_set_from_pst_access_policies() {
+        // Use the "full_mix" case: 1 template, 1 static policy, 1 link
+        let (_, pst_set) = policy_set_test_cases()
+            .into_iter()
+            .find(|(n, _)| *n == "full_mix")
+            .unwrap();
+        let api_set = PolicySet::from_pst(pst_set).unwrap();
+
+        // Template accessible
+        let tmpl = api_set.template(&PolicyId::new("access_tmpl")).unwrap();
+        assert_eq!(tmpl.effect(), Effect::Permit);
+        assert!(tmpl.slots().any(|s| *s == SlotId::principal()));
+
+        // Static policy accessible
+        let sp = api_set.policy(&PolicyId::new("admin_bypass")).unwrap();
+        assert!(sp.is_static());
+        assert_eq!(sp.effect(), Effect::Permit);
+
+        // Linked policy accessible
+        let lp = api_set.policy(&PolicyId::new("alice_access")).unwrap();
+        assert!(!lp.is_static());
+        assert_eq!(lp.template_id().unwrap().to_string(), "access_tmpl");
+        let links = lp.template_links().unwrap();
+        assert_eq!(links[&SlotId::principal()].to_string(), r#"User::"alice""#);
+    }
+
+    // --- PolicySet from_pst: linked policies decompose correctly in to_pst ---
+
+    #[test]
+    fn policy_set_linked_decompose_in_to_pst() {
+        let (_, pst_set) = policy_set_test_cases()
+            .into_iter()
+            .find(|(n, _)| *n == "template_multi_links")
+            .unwrap();
+        let api_set = PolicySet::from_pst(pst_set.clone()).unwrap();
+        let recovered = api_set.to_pst().unwrap();
+
+        // Templates preserved
+        assert_eq!(recovered.templates.len(), 1);
+        assert!(recovered
+            .templates
+            .contains_key(&pst::PolicyID("tmpl_multi".into())));
+
+        // No static policies (all were links)
+        assert!(recovered.policies.is_empty());
+
+        // Two links recovered
+        assert_eq!(recovered.template_links.len(), 2);
+        let ids: Vec<_> = recovered
+            .template_links
+            .iter()
+            .map(|l| l.new_id.0.as_str())
+            .collect();
+        assert!(ids.contains(&"deny_alice"));
+        assert!(ids.contains(&"deny_bob"));
+        for link in &recovered.template_links {
+            assert_eq!(link.template_id, pst::PolicyID("tmpl_multi".into()));
+            assert!(link.values.contains_key(&pst::SlotId::Principal));
+        }
+    }
+
+    // --- PolicySet from_pst error: duplicate template IDs ---
+
+    #[test]
+    fn policy_set_from_pst_duplicate_template_id() {
+        use linked_hash_map::LinkedHashMap;
+        // Build a PST with two templates that have the same ID.
+        // LinkedHashMap deduplicates keys, so we need to go through from_pst
+        // with a template ID that collides with a static policy ID.
+        let t = slotted_template(
+            "dup",
+            pst::Effect::Permit,
+            pst::PrincipalConstraint::Eq(pst::EntityOrSlot::Slot(pst::SlotId::Principal)),
+            pst::ActionConstraint::Any,
+            pst::ResourceConstraint::Any,
+            vec![],
+        );
+        let sp = pst::StaticPolicy::try_from(static_template(
+            "dup",
+            pst::Effect::Forbid,
+            pst::PrincipalConstraint::Any,
+            pst::ActionConstraint::Any,
+            pst::ResourceConstraint::Any,
+            vec![],
+        ))
+        .unwrap();
+        let mut templates = LinkedHashMap::new();
+        templates.insert(pst::PolicyID("dup".into()), t);
+        let mut policies = LinkedHashMap::new();
+        policies.insert(pst::PolicyID("dup".into()), sp);
+        let pst_set = pst::PolicySet {
+            templates,
+            policies,
+            template_links: vec![],
+        };
+        // Template "dup" is added first, then static policy "dup" should conflict
+        let err = PolicySet::from_pst(pst_set).unwrap_err();
+        assert!(
+            err.to_string().contains("dup"),
+            "error should mention the duplicate id: {err}"
+        );
+    }
+
+    // --- PolicySet from_pst error: link references nonexistent template ---
+
+    #[test]
+    fn policy_set_from_pst_link_missing_template() {
+        use linked_hash_map::LinkedHashMap;
+        let pst_set = pst::PolicySet {
+            templates: LinkedHashMap::new(),
+            policies: LinkedHashMap::new(),
+            template_links: vec![pst::TemplateLink {
+                template_id: pst::PolicyID("nonexistent".into()),
+                new_id: pst::PolicyID("link1".into()),
+                values: HashMap::from([(pst::SlotId::Principal, uid("User", "alice"))]),
+            }],
+        };
+        assert!(matches!(
+            PolicySet::from_pst(pst_set),
+            Err(PolicySetError::Linking(_))
+        ));
+    }
+
+    // --- PolicySet from_pst error: link with wrong slot values ---
+
+    #[test]
+    fn policy_set_from_pst_link_missing_slot_value() {
+        use linked_hash_map::LinkedHashMap;
+        let t = slotted_template(
+            "tmpl",
+            pst::Effect::Permit,
+            pst::PrincipalConstraint::Eq(pst::EntityOrSlot::Slot(pst::SlotId::Principal)),
+            pst::ActionConstraint::Any,
+            pst::ResourceConstraint::Any,
+            vec![],
+        );
+        let mut templates = LinkedHashMap::new();
+        templates.insert(pst::PolicyID("tmpl".into()), t);
+        let pst_set = pst::PolicySet {
+            templates,
+            policies: LinkedHashMap::new(),
+            template_links: vec![pst::TemplateLink {
+                template_id: pst::PolicyID("tmpl".into()),
+                new_id: pst::PolicyID("link1".into()),
+                values: HashMap::new(), // missing ?principal
+            }],
+        };
+        assert!(matches!(
+            PolicySet::from_pst(pst_set),
+            Err(PolicySetError::Linking(_))
+        ));
+    }
+
+    // --- PolicySet from_pst error: duplicate link IDs ---
+
+    #[test]
+    fn policy_set_from_pst_duplicate_link_id() {
+        use linked_hash_map::LinkedHashMap;
+        let t = slotted_template(
+            "tmpl",
+            pst::Effect::Permit,
+            pst::PrincipalConstraint::Eq(pst::EntityOrSlot::Slot(pst::SlotId::Principal)),
+            pst::ActionConstraint::Any,
+            pst::ResourceConstraint::Any,
+            vec![],
+        );
+        let mut templates = LinkedHashMap::new();
+        templates.insert(pst::PolicyID("tmpl".into()), t);
+        let pst_set = pst::PolicySet {
+            templates,
+            policies: LinkedHashMap::new(),
+            template_links: vec![
+                pst::TemplateLink {
+                    template_id: pst::PolicyID("tmpl".into()),
+                    new_id: pst::PolicyID("same_id".into()),
+                    values: HashMap::from([(pst::SlotId::Principal, uid("User", "alice"))]),
+                },
+                pst::TemplateLink {
+                    template_id: pst::PolicyID("tmpl".into()),
+                    new_id: pst::PolicyID("same_id".into()),
+                    values: HashMap::from([(pst::SlotId::Principal, uid("User", "bob"))]),
+                },
+            ],
+        };
+        assert!(matches!(
+            PolicySet::from_pst(pst_set),
+            Err(PolicySetError::Linking(_))
+        ));
+    }
+
+    // --- Cross-representation: text-parsed PolicySet → to_pst ---
+
+    #[test]
+    fn policy_set_text_to_pst() {
+        let policies_text = r#"
+            permit(principal == User::"alice", action == Action::"view", resource);
+            forbid(principal, action, resource) unless { principal.admin };
+        "#;
+        let pset = PolicySet::from_str(policies_text).unwrap();
+        let pst_set = pset.to_pst().unwrap();
+
+        assert_eq!(pst_set.templates.len(), 0);
+        assert_eq!(pst_set.policies.len(), 2);
+        assert_eq!(pst_set.template_links.len(), 0);
+
+        // Verify one permit and one forbid
+        let effects: Vec<_> = pst_set.policies.values().map(|sp| sp.body.effect).collect();
+        assert!(effects.contains(&pst::Effect::Permit));
+        assert!(effects.contains(&pst::Effect::Forbid));
+    }
+
+    // --- Cross-representation: text-parsed PolicySet → try_into_pst ---
+
+    #[test]
+    fn policy_set_text_try_into_pst() {
+        let policies_text = r#"
+            permit(principal is User, action in [Action::"read", Action::"list"], resource in Album::"shared");
+        "#;
+        let pset = PolicySet::from_str(policies_text).unwrap();
+        let pst_set = pset.try_into_pst().unwrap();
+
+        assert_eq!(pst_set.policies.len(), 1);
+        let sp = pst_set.policies.values().next().unwrap();
+        assert!(matches!(sp.body.principal, pst::PrincipalConstraint::Is(_)));
+        assert!(matches!(sp.body.action, pst::ActionConstraint::In(_)));
+        assert!(matches!(
+            sp.body.resource,
+            pst::ResourceConstraint::In(pst::EntityOrSlot::Entity(_))
+        ));
+    }
+
+    // --- Cross-representation: text template + link → to_pst decomposes correctly ---
+
+    #[test]
+    fn policy_set_text_template_link_to_pst() {
+        let tmpl_text = r#"permit(principal == ?principal, action == Action::"view", resource);"#;
+        let tmpl = Template::parse(Some(PolicyId::new("tmpl1")), tmpl_text).unwrap();
+        let mut pset = PolicySet::new();
+        pset.add_template(tmpl).unwrap();
+        let alice =
+            EntityUid::from_type_name_and_id("User".parse().unwrap(), "alice".parse().unwrap());
+        pset.link(
+            PolicyId::new("tmpl1"),
+            PolicyId::new("link_alice"),
+            HashMap::from([(SlotId::principal(), alice)]),
+        )
+        .unwrap();
+
+        let pst_set = pset.to_pst().unwrap();
+        // Template is preserved
+        assert_eq!(pst_set.templates.len(), 1);
+        assert!(pst_set
+            .templates
+            .contains_key(&pst::PolicyID("tmpl1".into())));
+        // Text-backed linked policies resolve slots → appear as a template link
+        // because the lossless repr is Text, which gets linked into a
+        // LosslessPolicy::Pst(Linked) via LosslessTemplate::link
+        assert_eq!(pst_set.template_links.len(), 1);
+        let link = &pst_set.template_links[0];
+        assert_eq!(link.template_id, pst::PolicyID("tmpl1".into()));
+        assert_eq!(link.new_id, pst::PolicyID("link_alice".into()));
+        assert_eq!(link.values[&pst::SlotId::Principal], uid("User", "alice"));
+    }
+
+    // --- Cross-representation: JSON-parsed PolicySet → to_pst ---
+
+    #[test]
+    fn policy_set_json_to_pst() {
+        let json = serde_json::json!({
+            "staticPolicies": {
+                "json_pol": {
+                    "effect": "permit",
+                    "principal": { "op": "All" },
+                    "action": { "op": "==", "entity": { "type": "Action", "id": "view" } },
+                    "resource": { "op": "All" },
+                    "conditions": [{ "kind": "when", "body": { "Value": true } }]
+                }
+            },
+            "templates": {},
+            "templateLinks": []
+        });
+        let pset = PolicySet::from_json_value(json).unwrap();
+        let pst_set = pset.to_pst().unwrap();
+
+        assert_eq!(pst_set.policies.len(), 1);
+        let sp = pst_set.policies.values().next().unwrap();
+        assert_eq!(sp.body.effect, pst::Effect::Permit);
+        assert!(matches!(sp.body.action, pst::ActionConstraint::Eq(_)));
+    }
+
+    // --- Mixed: PST + text policies in same PolicySet → to_pst ---
+
+    #[test]
+    fn policy_set_mixed_repr_to_pst() {
+        let mut pset = PolicySet::new();
+
+        // Add a policy from PST
+        let pst_sp = pst::StaticPolicy::try_from(static_template(
+            "pst_policy",
+            pst::Effect::Permit,
+            pst::PrincipalConstraint::Eq(pst::EntityOrSlot::Entity(uid("User", "alice"))),
+            pst::ActionConstraint::Any,
+            pst::ResourceConstraint::Any,
+            vec![when_true()],
+        ))
+        .unwrap();
+        let p1 = Policy::from_pst(pst_sp.into()).unwrap();
+        pset.add(p1).unwrap();
+
+        // Add a policy from text
+        let p2: Policy = r#"forbid(principal, action == Action::"delete", resource);"#
+            .parse::<Policy>()
+            .unwrap()
+            .new_id(PolicyId::new("text_policy"));
+        pset.add(p2).unwrap();
+
+        let pst_set = pset.to_pst().unwrap();
+        assert_eq!(pst_set.policies.len(), 2);
+        assert!(pst_set
+            .policies
+            .contains_key(&pst::PolicyID("pst_policy".into())));
+        assert!(pst_set
+            .policies
+            .contains_key(&pst::PolicyID("text_policy".into())));
+    }
+
+    // --- Verify from_pst preserves annotations ---
+
+    #[test]
+    fn policy_set_from_pst_preserves_annotations() {
+        let (_, pst_set) = policy_set_test_cases()
+            .into_iter()
+            .find(|(n, _)| *n == "annotated_policy")
+            .unwrap();
+        let api_set = PolicySet::from_pst(pst_set).unwrap();
+        let p = api_set.policy(&PolicyId::new("annotated")).unwrap();
+        assert_eq!(p.annotation("reason"), Some("testing"));
+        assert_eq!(p.annotation("id"), Some("annotated"));
+    }
+
+    // --- Verify from_pst → to_pst roundtrip for both-slot template with link ---
+
+    #[test]
+    fn policy_set_both_slots_link_roundtrip() {
+        let (_, pst_set) = policy_set_test_cases()
+            .into_iter()
+            .find(|(n, _)| *n == "both_slots_linked")
+            .unwrap();
+        let api_set = PolicySet::from_pst(pst_set.clone()).unwrap();
+
+        // Verify the linked policy has both slot values
+        let lp = api_set.policy(&PolicyId::new("alice_photos")).unwrap();
+        let links = lp.template_links().unwrap();
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[&SlotId::principal()].to_string(), r#"User::"alice""#);
+        assert_eq!(
+            links[&SlotId::resource()].to_string(),
+            r#"Album::"vacation""#
+        );
+
+        // Roundtrip
+        let recovered = api_set.to_pst().unwrap();
+        assert_pst_sets_eq(&pst_set, &recovered, "both_slots_linked roundtrip");
+    }
+}
+
+#[cfg(feature = "tolerant-ast")]
+mod tolerant_ast_tests {
+    use super::*;
+    use cedar_policy_core::ast;
+
+    /// Helper: build a TemplateBody with ActionConstraint::ErrorConstraint
+    fn template_body_with_error_action() -> ast::TemplateBody {
+        let pc = ast::PrincipalConstraint::new(ast::PrincipalOrResourceConstraint::any());
+        let rc = ast::ResourceConstraint::new(ast::PrincipalOrResourceConstraint::any());
+        ast::TemplateBody::new(
+            ast::PolicyID::from_string("error_action_test"),
+            None,
+            ast::Annotations::default(),
+            ast::Effect::Permit,
+            pc,
+            ast::ActionConstraint::ErrorConstraint,
+            rc,
+            None,
+        )
+    }
+
+    #[test]
+    #[should_panic(expected = "internal ErrorConstraint cannot be represented in the public API")]
+    fn template_action_constraint_error_panics() {
+        let tb = template_body_with_error_action();
+        let ast_template = ast::Template::from(tb);
+        let template = Template::from_ast(ast_template);
+        let _ = template.action_constraint();
+    }
+
+    #[test]
+    #[should_panic(expected = "internal ErrorConstraint cannot be represented in the public API")]
+    fn policy_action_constraint_error_panics() {
+        let tb = template_body_with_error_action();
+        let ast_template = ast::Template::from(tb);
+        let static_policy = ast::StaticPolicy::try_from(ast_template).unwrap();
+        let ast_policy = ast::Policy::from(static_policy);
+        let policy = Policy::from_ast(ast_policy);
+        let _ = policy.action_constraint();
+    }
+}
