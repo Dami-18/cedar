@@ -1,7 +1,7 @@
 /*
  * Copyright Cedar Contributors
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
+ * Licensed under the Apache License, Version 2.0 (the "License_");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
@@ -15,33 +15,171 @@
  */
 
 //! This module contains PolTree structure used for policy evaluation. It is a tree structure where each node represents a policy statement or a condition
- 
+
 use crate::ast::*;
-use crate::authorizer::Decision;
+use crate::authorizer::{Decision, Diagnostics};
 use crate::entities::{Dereference, Entities};
-use smol_str::SmolStr;
+use serde::{Deserialize, Serialize};
+use smol_str::{SmolStr, ToSmolStr};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+// use rkyv::{Archive, Deserialize, Serialize};
+
+const SCOPE_PRINCIPAL_ATTR: &str = "__scope_principal";
+const SCOPE_RESOURCE_ATTR: &str = "__scope_resource";
+const SCOPE_ACTION_ATTR: &str = "__scope_action";
+
+#[derive(Debug, Clone)]
+struct Constraint {
+    attr: SmolStr,
+    values: Vec<Literal>,
+    candidates: HashSet<EntityUID>,
+}
+
+fn entities_with_attr_literal(
+    entities: &Entities,
+    attr: &SmolStr,
+    lit: &Literal,
+) -> HashSet<EntityUID> {
+    entities
+        .iter()
+        .filter(|e| {
+            e.get(attr).and_then(|pv| match pv {
+                PartialValue::Value(v) => v.try_as_lit(),
+                _ => None,
+            }) == Some(lit)
+        })
+        .map(|e| e.uid().clone())
+        .collect()
+}
+
+fn entities_with_uid(entities: &Entities, uid: &EntityUID) -> HashSet<EntityUID> {
+    entities
+        .iter()
+        .filter(|e| e.uid() == uid)
+        .map(|e| e.uid().clone())
+        .collect()
+}
+
+fn entities_with_type(entities: &Entities, entity_type: &EntityType) -> HashSet<EntityUID> {
+    entities
+        .iter()
+        .filter(|e| e.uid().entity_type() == entity_type)
+        .map(|e| e.uid().clone())
+        .collect()
+}
+
+fn request_scope_literal(request: &Request, attr: &SmolStr) -> Option<Literal> {
+    match attr.as_str() {
+        SCOPE_PRINCIPAL_ATTR => request
+            .principal()
+            .uid()
+            .map(|uid| Literal::EntityUID(Arc::new(uid.clone()))),
+        SCOPE_RESOURCE_ATTR => request
+            .resource()
+            .uid()
+            .map(|uid| Literal::EntityUID(Arc::new(uid.clone()))),
+        SCOPE_ACTION_ATTR => request
+            .action()
+            .uid()
+            .map(|uid| Literal::EntityUID(Arc::new(uid.clone()))),
+        _ => None,
+    }
+}
+
+fn request_values_for_attr(request: &Request, entities: &Entities, attr: &SmolStr) -> Vec<Literal> {
+    if let Some(scope_literal) = request_scope_literal(request, attr) {
+        return vec![scope_literal];
+    }
+
+    let mut values: HashSet<Literal> = HashSet::new();
+
+    for entry in [request.resource(), request.principal()] {
+        let Some(uid) = entry.uid() else {
+            continue;
+        };
+        if let Dereference::Data(entity) = entities.entity(uid) {
+            if let Some(PartialValue::Value(v)) = entity.get(attr.as_str()) {
+                if let Some(lit) = v.try_as_lit() {
+                    values.insert(lit.clone());
+                }
+            }
+        }
+    }
+
+    values.into_iter().collect()
+}
+
+fn principal_or_resource_scope_constraints(
+    entities: &Entities,
+    attr_name: &str,
+    constraint: &PrincipalOrResourceConstraint,
+) -> Vec<Constraint> {
+    let attr = SmolStr::from(attr_name);
+    match constraint {
+        PrincipalOrResourceConstraint::Any => vec![],
+        PrincipalOrResourceConstraint::Eq(EntityReference::EUID(uid)) => vec![Constraint {
+            attr,
+            values: vec![Literal::EntityUID(uid.clone())],
+            candidates: entities_with_uid(entities, uid),
+        }],
+        PrincipalOrResourceConstraint::Is(entity_type) => vec![Constraint {
+            attr,
+            values: vec![Literal::String(entity_type.to_smolstr())],
+            candidates: entities_with_type(entities, entity_type),
+        }],
+        PrincipalOrResourceConstraint::In(EntityReference::EUID(_))
+        | PrincipalOrResourceConstraint::IsIn(_, EntityReference::EUID(_)) => vec![],
+        PrincipalOrResourceConstraint::Eq(EntityReference::Slot(_))
+        | PrincipalOrResourceConstraint::In(EntityReference::Slot(_))
+        | PrincipalOrResourceConstraint::IsIn(_, EntityReference::Slot(_)) => vec![],
+    }
+}
+
+fn action_scope_constraints(entities: &Entities, constraint: &ActionConstraint) -> Vec<Constraint> {
+    let attr = SmolStr::from(SCOPE_ACTION_ATTR);
+    match constraint {
+        ActionConstraint::Any => vec![],
+        ActionConstraint::Eq(uid) => vec![Constraint {
+            attr,
+            values: vec![Literal::EntityUID(uid.clone())],
+            candidates: entities_with_uid(entities, uid),
+        }],
+        ActionConstraint::In(_) => vec![],
+        #[cfg(feature = "tolerant-ast")]
+        ActionConstraint::ErrorConstraint => vec![],
+    }
+}
 
 // Expr-tree walker: extract (attr, Literal) equality constraints from the non-scope condition of a policy
-fn collect_attr_constraints(expr: &Expr, constraints: &mut Vec<(SmolStr, Literal)>) { 
+fn collect_attr_constraints(expr: &Expr, constraints: &mut Vec<(SmolStr, Literal)>) {
     match expr.expr_kind() {
         ExprKind::And { left, right } => {
             collect_attr_constraints(left, constraints);
             collect_attr_constraints(right, constraints);
         }
-        ExprKind::BinaryApp { op: BinaryOp::Eq, arg1, arg2 } => {
+        ExprKind::BinaryApp {
+            op: BinaryOp::Eq,
+            arg1,
+            arg2,
+        } => {
             match (arg1.expr_kind(), arg2.expr_kind()) {
                 (
                     ExprKind::GetAttr { expr: base, attr }, // rename to base to avoid conflict with function argument
                     ExprKind::Lit(lit),
-                ) if matches!(base.expr_kind(), ExprKind::Var(Var::Resource) | ExprKind::Var(Var::Principal)) => {
+                ) if matches!(
+                    base.expr_kind(),
+                    ExprKind::Var(Var::Resource) | ExprKind::Var(Var::Principal)
+                ) =>
+                {
                     constraints.push((attr.clone(), lit.clone()));
                 }
-                (
-                    ExprKind::Lit(lit),
-                    ExprKind::GetAttr { expr: base, attr },
-                ) if matches!(base.expr_kind(), ExprKind::Var(Var::Resource) | ExprKind::Var(Var::Principal)) => {
+                (ExprKind::Lit(lit), ExprKind::GetAttr { expr: base, attr })
+                    if matches!(
+                        base.expr_kind(),
+                        ExprKind::Var(Var::Resource) | ExprKind::Var(Var::Principal)
+                    ) =>
+                {
                     constraints.push((attr.clone(), lit.clone()));
                 }
                 _ => {}
@@ -52,7 +190,7 @@ fn collect_attr_constraints(expr: &Expr, constraints: &mut Vec<(SmolStr, Literal
 }
 
 /// struct representing the entire PolTree
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolTree {
     /// Root node of the PolTree
     pub root: PolTreeNode,
@@ -66,13 +204,15 @@ impl PolTree {
         entities: Vec<EntityUID>,
         index: &PolTreeIndex,
     ) -> Self {
-        fn make_leaf(
-            policy_ids: Vec<PolicyID>,
-            entities: Vec<EntityUID>,
-        ) -> PolTreeNode {
-            let decision = if policy_ids.is_empty() { Decision::Deny } else { Decision::Allow };
+        fn make_leaf(policy_ids: Vec<PolicyID>, entities: Vec<EntityUID>) -> PolTreeNode {
+            let decision = if policy_ids.is_empty() {
+                Decision::Deny
+            } else {
+                Decision::Allow
+            };
             PolTreeNode {
                 attr_val: None,
+                split_attr: None,
                 children: vec![],
                 sv: entities,
                 pv: policy_ids,
@@ -90,9 +230,21 @@ impl PolTree {
                 return make_leaf(policy_ids, entities);
             }
 
-            let best_attr = match best_attribute(&policy_ids, &entities, index, &attrs) {
+            // Find best attr; if entropy=0 for all, still pick one that has pv_map entries
+            let best_attr = best_attribute(&policy_ids, &entities, index, &attrs).or_else(|| {
+                // fallback: pick any attr that still has policy constraints
+                attrs
+                    .iter()
+                    .find(|attr| {
+                        let ps: HashSet<&PolicyID> = policy_ids.iter().collect();
+                        !index.values_for_attr_in_policies(attr, &ps).is_empty()
+                    })
+                    .cloned()
+            });
+
+            let best_attr = match best_attr {
                 Some(a) => a,
-                None => return make_leaf(policy_ids, entities), // no information gain
+                None => return make_leaf(policy_ids, entities), // truly no constraints left
             };
 
             // Build HashSets once before the loop so every membership test is O(1) instead of O(n)
@@ -108,32 +260,62 @@ impl PolTree {
             let remaining_attrs: Vec<SmolStr> =
                 attrs.into_iter().filter(|a| *a != best_attr).collect();
 
-            let children: Vec<Box<PolTreeNode>> = values
-                .iter()
-                .map(|val| {
-                    // Pv: policies in the current set where best_attr = val
-                    let pv: Vec<PolicyID> = index
-                        .get_pv(&best_attr, val)
-                        .iter()
-                        .filter(|id| policy_set.contains(id))
-                        .cloned()
-                        .collect();
+            let children: Vec<Box<PolTreeNode>> = {
+                let mut ch: Vec<Box<PolTreeNode>> = values
+                    .iter()
+                    .map(|val| {
+                        // Pv: policies in the current set where best_attr = val
+                        let pv: Vec<PolicyID> = index
+                            .get_pv(&best_attr, val)
+                            .iter()
+                            .filter(|id| policy_set.contains(id))
+                            .cloned()
+                            .collect();
 
-                    // Sv: entities covered by Pv, intersected with current partition
-                    let sv: Vec<EntityUID> = index
-                        .get_sv_for_policies(&pv)
+                        // Sv: entities covered by Pv, intersected with current partition
+                        let sv: Vec<EntityUID> = index
+                            .get_sv_for_policies(&pv)
+                            .into_iter()
+                            .filter(|e| entity_set.contains(e))
+                            .collect();
+
+                        let mut child = build_node(pv, remaining_attrs.clone(), sv, index);
+                        child.attr_val = Some((best_attr.clone(), val.clone()));
+                        Box::new(child)
+                    })
+                    .collect();
+
+                // policies with NO constraint on best_attr go under "*" branch
+                let constrained_policies: HashSet<&PolicyID> = values
+                    .iter()
+                    .flat_map(|val| index.get_pv(&best_attr, val))
+                    .filter(|id| policy_set.contains(id))
+                    .collect();
+
+                let wildcard_pv: Vec<PolicyID> = policy_ids
+                    .iter()
+                    .filter(|id| !constrained_policies.contains(id))
+                    .cloned()
+                    .collect();
+
+                if !wildcard_pv.is_empty() {
+                    let wildcard_sv: Vec<EntityUID> = index
+                        .get_sv_for_policies(&wildcard_pv)
                         .into_iter()
                         .filter(|e| entity_set.contains(e))
                         .collect();
-
-                    let mut child = build_node(pv, remaining_attrs.clone(), sv, index);
-                    child.attr_val = Some((best_attr.clone(), val.clone()));
-                    Box::new(child)
-                })
-                .collect();
+                    let mut wildcard_child =
+                        build_node(wildcard_pv, remaining_attrs.clone(), wildcard_sv, index);
+                    wildcard_child.attr_val =
+                        Some((best_attr.clone(), Literal::String("*".into())));
+                    ch.push(Box::new(wildcard_child));
+                }
+                ch
+            };
 
             PolTreeNode {
                 attr_val: None,
+                split_attr: Some(best_attr.clone()),
                 children,
                 sv: entities,
                 pv: policy_ids,
@@ -143,6 +325,100 @@ impl PolTree {
 
         PolTree {
             root: build_node(policy_ids, attrs, entities, index),
+        }
+    }
+
+    /// Convenience constructor which derives all required PolTree inputs from a [`PolicySet`] and an [`Entities`] store.
+    pub fn from_policy_set_and_entities(policy_set: &PolicySet, entities: Arc<Entities>) -> Self {
+        let index = PolTreeIndex::build_from_policy_set(policy_set, entities);
+        let policy_ids: Vec<PolicyID> = policy_set.policies().map(|p| p.id().clone()).collect();
+        let mut attrs: Vec<SmolStr> = index.attr_values.keys().cloned().collect();
+        attrs.sort();
+        attrs.dedup();
+        let entities: Vec<EntityUID> = index.entities.iter().map(|e| e.uid().clone()).collect();
+        Self::build_n_poltree(policy_ids, attrs, entities, &index)
+    }
+
+    /// Evaluate one access request against this N-PolTree.
+    /// Traversal follows exact-value branches first and keeps `*` branches in tracker for backtracking if an explored branch denies
+    pub fn evaluate_request(
+        &self,
+        request: &Request,
+        entities: &Entities,
+    ) -> (Decision, Diagnostics) {
+        let mut current = &self.root;
+        let mut tracker: Vec<&PolTreeNode> = Vec::new();
+        loop {
+            if current.children.is_empty() {
+                if current.eval == Some(Decision::Allow) {
+                    return (
+                        Decision::Allow,
+                        Diagnostics {
+                            reason: current.pv.iter().cloned().collect(),
+                            errors: vec![],
+                        },
+                    );
+                }
+                if let Some(next) = tracker.pop() {
+                    current = next;
+                    continue;
+                }
+                return (
+                    Decision::Deny,
+                    Diagnostics {
+                        reason: HashSet::new(),
+                        errors: vec![],
+                    },
+                );
+            }
+            let split_attr = match &current.split_attr {
+                Some(attr) => attr,
+                None => {
+                    if let Some(next) = tracker.pop() {
+                        current = next;
+                        continue;
+                    }
+                    return (
+                        Decision::Deny,
+                        Diagnostics {
+                            reason: HashSet::new(),
+                            errors: vec![],
+                        },
+                    );
+                }
+            };
+            let request_val = request_values_for_attr(request, entities, split_attr);
+            let mut wildcard_child: Option<&PolTreeNode> = None;
+            let mut exact_children: Vec<&PolTreeNode> = Vec::new();
+
+            for child in &current.children {
+                if let Some((_, edge_val)) = &child.attr_val {
+                    if matches!(edge_val, Literal::String(s) if s == "*") {
+                        wildcard_child = Some(child.as_ref());
+                    }
+                    if request_val.contains(edge_val) {
+                        exact_children.push(child.as_ref());
+                    }
+                }
+            }
+            if let Some(wildcard) = wildcard_child {
+                tracker.push(wildcard);
+            }
+            if let Some(next) = exact_children.into_iter().next() {
+                current = next;
+                continue;
+            }
+            if let Some(next) = tracker.pop() {
+                current = next;
+                continue;
+            }
+            return (
+                Decision::Deny,
+                Diagnostics {
+                    reason: HashSet::new(),
+                    errors: vec![],
+                },
+            );
         }
     }
 }
@@ -178,49 +454,69 @@ impl PolTreeIndex {
 
         for policy in policy_set.policies() {
             let pid = policy.id().clone();
-            let mut constraints: Vec<(SmolStr, Literal)> = Vec::new();
+            let mut constraints: Vec<Constraint> = Vec::new();
+
+            constraints.extend(principal_or_resource_scope_constraints(
+                entities.as_ref(),
+                SCOPE_PRINCIPAL_ATTR,
+                policy.template().principal_constraint().as_inner(),
+            ));
+            constraints.extend(principal_or_resource_scope_constraints(
+                entities.as_ref(),
+                SCOPE_RESOURCE_ATTR,
+                policy.template().resource_constraint().as_inner(),
+            ));
+            constraints.extend(action_scope_constraints(
+                entities.as_ref(),
+                policy.template().action_constraint(),
+            ));
+
+            let mut non_scope_constraints: Vec<(SmolStr, Literal)> = Vec::new();
 
             // Walk the non-scope (when/unless) condition expression
             if let Some(expr) = policy.template().non_scope_constraints() {
-                collect_attr_constraints(expr, &mut constraints);
+                collect_attr_constraints(expr, &mut non_scope_constraints);
+            }
+
+            constraints.extend(
+                non_scope_constraints
+                    .into_iter()
+                    .map(|(attr, lit)| Constraint {
+                        candidates: entities_with_attr_literal(entities.as_ref(), &attr, &lit),
+                        attr,
+                        values: vec![lit],
+                    }),
+            );
+
+            if constraints.is_empty() {
+                continue;
             }
 
             // Register each extracted constraint in pv_map
-            for (attr, val) in &constraints {
-                pv_map
-                    .entry((attr.clone(), val.clone()))
-                    .or_default()
-                    .push(pid.clone());
+            for constraint in &constraints {
+                for value in &constraint.values {
+                    pv_map
+                        .entry((constraint.attr.clone(), value.clone()))
+                        .or_default()
+                        .push(pid.clone());
+                }
             }
 
             // Compute policy_entities_map: entities that satisfy ALL extracted
             // constraints for this policy (intersection across constraints)
-            // If no constraints were found, no entities are associated
-            if !constraints.is_empty() {
-                // Start with the candidates for the first constraint, then intersect with candidates for each subsequent constraint.
-                let mut covered: Option<HashSet<EntityUID>> = None;
-                for (attr, val) in &constraints {
-                    let candidates: HashSet<EntityUID> = entities
-                        .iter()
-                        .filter(|e| {
-                            if let Some(pv) = e.get(attr) {
-                                if let PartialValue::Value(v) = pv {
-                                    return v.try_as_lit() == Some(val);
-                                }
-                            }
-                            false
-                        })
-                        .map(|e| e.uid().clone())
-                        .collect();
-
-                    covered = Some(match covered.take() {
-                        None => candidates,
-                        Some(existing) => existing.intersection(&candidates).cloned().collect(),
-                    });
-                }
-                if let Some(set) = covered {
-                    policy_entities_map.insert(pid, set.into_iter().collect());
-                }
+            // Start with the candidates for the first constraint, then intersect with candidates for each subsequent constraint.
+            let mut covered: Option<HashSet<EntityUID>> = None;
+            for constraint in &constraints {
+                covered = Some(match covered.take() {
+                    None => constraint.candidates.clone(),
+                    Some(existing) => existing
+                        .intersection(&constraint.candidates)
+                        .cloned()
+                        .collect(),
+                });
+            }
+            if let Some(set) = covered {
+                policy_entities_map.insert(pid, set.into_iter().collect());
             }
         }
 
@@ -318,7 +614,6 @@ impl PolTreeIndex {
             .into_iter()
             .collect()
     }
-
 }
 
 fn attr_entropy(sv: &[EntityUID], index: &PolTreeIndex, attr: &SmolStr) -> f64 {
@@ -359,7 +654,11 @@ fn best_attribute(
 
     attrs
         .iter()
-        .filter(|attr| !index.values_for_attr_in_policies(attr, &policy_set).is_empty())
+        .filter(|attr| {
+            !index
+                .values_for_attr_in_policies(attr, &policy_set)
+                .is_empty()
+        })
         .map(|attr| (attr, attr_entropy(sv, index, attr)))
         .filter(|(_, h)| h.is_finite() && *h > 0.0)
         .max_by(|(_, h1), (_, h2)| h1.partial_cmp(h2).unwrap())
@@ -367,10 +666,12 @@ fn best_attribute(
 }
 
 /// Node in the PolTree
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolTreeNode {
-    /// The attribute value pair this node splits on (None for leaf nodes)
-    pub attr_val: Option<(SmolStr,Literal)>,
+    /// The attribute value pair this node got split on from its parent (Label on the incoming edge, None for root)
+    pub attr_val: Option<(SmolStr, Literal)>,
+    /// The attribute this node splits on
+    pub split_attr: Option<SmolStr>,
     /// Child nodes
     pub children: Vec<Box<PolTreeNode>>,
     /// Sv: entity UIDs covered by the policies in this partition

@@ -26,6 +26,7 @@ use crate::evaluator::Evaluator;
 use crate::extensions::Extensions;
 use crate::poltree::PolTree;
 use itertools::{Either, Itertools};
+// use rkyv::{Archive, Deserialize, Serialize};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -92,6 +93,21 @@ impl Authorizer {
             authorizer: self,
             pset,
             entities,
+            poltree,
+        }
+    }
+
+    /// Build reusable authorization context using a prebuilt [`PolTree`].
+    pub fn prepare_with_poltree<'a>(
+        &'a self,
+        pset: &'a PolicySet,
+        entities: &Entities,
+        poltree: PolTree,
+    ) -> TreeAuthorizer<'a> {
+        TreeAuthorizer {
+            authorizer: self,
+            pset,
+            entities: Arc::new(entities.clone()),
             poltree,
         }
     }
@@ -203,6 +219,11 @@ impl<'a> TreeAuthorizer<'a> {
     pub fn is_authorized_core(&self, q: Request) -> PartialResponse {
         self.authorizer
             .is_authorized_core(q, self.pset, self.entities.as_ref())
+    }
+
+    /// Access the underlying prepared [`PolTree`].
+    pub fn poltree(&self) -> &PolTree {
+        &self.poltree
     }
 }
 
@@ -741,7 +762,6 @@ impl Response {
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
 #[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
 #[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
-#[serde(rename_all = "camelCase")]
 pub enum Decision {
     /// The `Authorizer` determined that the request should be allowed
     Allow,

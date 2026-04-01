@@ -16,6 +16,8 @@ cedar-policy-formatter = { version = "=4.10.0", path = "../cedar-policy-formatte
 ref-cast = "1.0"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
+postcard = {version = "1.0", features = ["use-std"]}
+# rkyv = { version = "0.8", features = ["validation", "archive_le", "size_32"] }
 itertools = "0.14"
 miette = "7.6.0"
 thiserror = "2.0"

@@ -1069,6 +1069,17 @@ impl Authorizer {
         TreeAuthorizer(self.0.prepare(&p.ast, &e.0))
     }
 
+    /// Restore reusable authorization context from a serialized PolTree.
+    pub fn prepare_from_serialized<'a>(
+        &'a self,
+        p: &'a PolicySet,
+        e: &Entities,
+        serialized_poltree: &[u8],
+    ) -> Result<TreeAuthorizer<'a>, postcard::Error> {
+        let poltree = postcard::from_bytes(serialized_poltree)?;
+        Ok(TreeAuthorizer(self.0.prepare_with_poltree(&p.ast, &e.0, poltree)))
+    }
+
     /// Returns an authorization response for `r` with respect to the given
     /// `PolicySet` and `Entities`.
     ///
@@ -1149,6 +1160,11 @@ impl TreeAuthorizer<'_> {
     /// Authorize a request using prepared authorization context.
     pub fn is_authorized(&self, r: &Request) -> Response {
         self.0.is_authorized(r.0.clone()).into()
+    }
+
+    /// Serialize the prepared PolTree for fast reloading in future runs.
+    pub fn serialize_poltree(&self) -> Result<Vec<u8>, postcard::Error> {
+        postcard::to_stdvec(self.0.poltree())   
     }
 
     /// Partial-evaluation variant using prepared context.

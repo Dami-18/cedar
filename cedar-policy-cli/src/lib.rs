@@ -30,17 +30,20 @@ use miette::{miette, IntoDiagnostic, NamedSource, Report, Result, WrapErr};
 use owo_colors::OwoColorize;
 use serde::de::{DeserializeSeed, IntoDeserializer};
 use serde::{Deserialize, Deserializer, Serialize};
+// use rkyv::{Archive, Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::io::{BufReader, Write};
+use std::hash::Hasher;
+use std::io::{BufReader, Read, Write};
 use std::{
     collections::HashMap,
     fmt::{self, Display},
-    fs::OpenOptions,
+    fs::{self, OpenOptions},
     path::{Path, PathBuf},
     process::{ExitCode, Termination},
     str::FromStr,
     time::Instant,
 };
+use xxhash_rust::xxh3::Xxh3;
 
 use cedar_policy::*;
 use cedar_policy_formatter::{policies_str_to_pretty, Config};
@@ -2781,17 +2784,91 @@ enum JsonPolicyType {
     PolicySet,
 }
 
+const POLTREE_CACHE_VERSION: u32 = 1;
+
+fn policy_format_tag(policy_format: PolicyFormat) -> u8 {
+    match policy_format {
+        PolicyFormat::Cedar => 1,
+        PolicyFormat::Json => 2,
+    }
+}
+
+fn hash_file(path: &Path) -> Result<u64> {
+    let mut file = std::fs::File::open(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to open file {} for hashing", path.display()))?;
+    let mut hasher = Xxh3::new();
+    let mut buf = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buf)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to read file {} while hashing", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.write(&buf[..read]);
+    }
+    Ok(hasher.finish())
+}
+
+fn hash_file_if_exists(path: &Path) -> Result<u64> {
+    if path.exists() {
+        hash_file(path)
+    } else {
+        Ok(0)
+    }
+}
+
+fn poltree_cache_path(
+    policies: &PoliciesArgs,
+    entities_filename: &Path,
+    schema_file: Option<&Path>,
+) -> Result<Option<PathBuf>> {
+    let Some(policy_file) = policies.policies_file.as_ref() else {
+        return Ok(None);
+    };
+
+    let policy_hash = hash_file(Path::new(policy_file))?;
+    let entities_hash = hash_file(entities_filename)?;
+    let schema_hash = match schema_file {
+        Some(path) => hash_file(path)?,
+        None => 0,
+    };
+    let template_hash = match policies.template_linked_file.as_ref() {
+        Some(path) => hash_file_if_exists(Path::new(path))?,
+        None => 0,
+    };
+    let policy_format = policy_format_tag(policies.policy_format);
+
+    let cache_dir = std::env::current_dir()
+        .into_diagnostic()
+        .wrap_err("failed to resolve current directory")?
+        .join("target")
+        .join(".cedar")
+        .join("poltree-cache");
+    fs::create_dir_all(&cache_dir)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to create cache directory {}", cache_dir.display()))?;
+
+    let file_name = format!(
+        "v{POLTREE_CACHE_VERSION}_pf{policy_format}_{policy_hash:016x}_{entities_hash:016x}_{schema_hash:016x}_{template_hash:016x}.bin"
+    );
+    Ok(Some(cache_dir.join(file_name)))
+}
+
 /// This uses the Cedar API to call the authorization engine.
 fn execute_request(
     request: &RequestArgs,
-    policies: &PoliciesArgs,
+    policies_args: &PoliciesArgs,
     entities_filename: impl AsRef<Path>,
     schema: &OptionalSchemaArgs,
     compute_duration: bool,
     use_poltree: bool,
 ) -> Result<Response, Vec<Report>> {
     let mut errs = vec![];
-    let policies = match policies.get_policy_set() {
+    let schema_file_for_cache = schema.schema_file.clone();
+    let policy_set = match policies_args.get_policy_set() {
         Ok(pset) => pset,
         Err(e) => {
             errs.push(e);
@@ -2805,7 +2882,7 @@ fn execute_request(
             None
         }
     };
-    let entities = match load_entities(entities_filename, schema.as_ref()) {
+    let entities = match load_entities(entities_filename.as_ref(), schema.as_ref()) {
         Ok(entities) => entities,
         Err(e) => {
             errs.push(e);
@@ -2817,18 +2894,97 @@ fn execute_request(
             let authorizer = Authorizer::new();
             let ans = if use_poltree {
                 let tree_build_start = Instant::now();
-                let poltree = authorizer.prepare(&policies, &entities);
-                let tree_build_dur = tree_build_start.elapsed();
+                let cache_path = match poltree_cache_path(
+                    policies_args,
+                    entities_filename.as_ref(),
+                    schema_file_for_cache.as_deref(),
+                ) {
+                    Ok(path) => path,
+                    Err(_) => None,
+                };
+                let mut cache_hit = false;
+                let mut cache_read_dur: Option<std::time::Duration> = None;
+                let mut cache_deser_dur: Option<std::time::Duration> = None;
+                let poltree = if let Some(cache_path) = cache_path.as_ref() {
+                    if cache_path.exists() {
+                        // Measure read and deserialize separately so we can see where time goes
+                        let read_start = Instant::now();
+                        match fs::read(cache_path) {
+                            Ok(bytes) => {
+                                let read_dur = read_start.elapsed();
+                                let deser_start = Instant::now();
+                                match authorizer.prepare_from_serialized(&policy_set, &entities, &bytes) {
+                                    Ok(tree) => {
+                                        let deser_dur = deser_start.elapsed();
+                                        cache_hit = true;
+                                        cache_read_dur = Some(read_dur);
+                                        cache_deser_dur = Some(deser_dur);
+                                        if compute_duration {
+                                            println!(
+                                                "Cache read (micro seconds) : {}",
+                                                read_dur.as_micros()
+                                            );
+                                            println!(
+                                                "Cache deserialize (micro seconds) : {}",
+                                                deser_dur.as_micros()
+                                            );
+                                        }
+                                        tree
+                                    }
+                                    Err(_) => {
+                                        let tree = authorizer.prepare(&policy_set, &entities);
+                                        if let Ok(bytes) = tree.serialize_poltree() {
+                                            let _ = fs::write(cache_path, bytes);
+                                        }
+                                        tree
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                let tree = authorizer.prepare(&policy_set, &entities);
+                                if let Ok(bytes) = tree.serialize_poltree() {
+                                    let _ = fs::write(cache_path, bytes);
+                                }
+                                tree
+                            }
+                        }
+                    } else {
+                        let tree = authorizer.prepare(&policy_set, &entities);
+                        if let Ok(bytes) = tree.serialize_poltree() {
+                            let _ = fs::write(cache_path, bytes);
+                        }
+                        tree
+                    }
+                } else {
+                    authorizer.prepare(&policy_set, &entities)
+                };
+                let tree_build_dur = if cache_hit {
+                    // Sum read + deserialize durations when cache was used (fallback to total elapsed)
+                    match (cache_read_dur, cache_deser_dur) {
+                        (Some(r), Some(d)) => r + d,
+                        _ => tree_build_start.elapsed(),
+                    }
+                } else {
+                    tree_build_start.elapsed()
+                };
 
                 let tree_auth_start = Instant::now();
                 let ans = poltree.is_authorized(&request);
                 let tree_auth_dur = tree_auth_start.elapsed();
 
                 if compute_duration {
-                    println!(
-                        "Tree Build Time (micro seconds) : {}",
-                        tree_build_dur.as_micros()
-                    );
+                    println!("Tree Cache Hit               : {cache_hit}");
+                    if cache_hit {
+                        println!(
+                            "Tree Load Time (micro seconds) : {}",
+                            tree_build_dur.as_micros()
+                        );
+                    } else {
+                        println!(
+                            "Tree Build Time (micro seconds) : {}",
+                            tree_build_dur.as_micros()
+                        );
+                    }
                     println!(
                         "Tree Authorization Time (micro seconds) : {}",
                         tree_auth_dur.as_micros()
@@ -2837,7 +2993,7 @@ fn execute_request(
                 ans
             } else {
                 let auth_start = Instant::now();
-                let ans = authorizer.is_authorized(&request, &policies, &entities);
+                let ans = authorizer.is_authorized(&request, &policy_set, &entities);
                 let auth_dur = auth_start.elapsed();
 
                 if compute_duration {
