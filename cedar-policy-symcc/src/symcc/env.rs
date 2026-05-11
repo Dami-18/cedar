@@ -307,14 +307,9 @@ impl SymEntityData {
             }))
         };
         let acts = sch
-            .iter()
-            .filter_map(|(uid, _)| {
-                if uid.type_name() == act_ty {
-                    Some(<EntityID as AsRef<str>>::as_ref(uid.id()).into())
-                } else {
-                    None
-                }
-            })
+            .keys()
+            .filter(|uid| uid.type_name() == act_ty)
+            .map(|uid| SmolStr::new(uid.id()))
             .collect();
         SymEntityData {
             attrs: attrs_udf,
@@ -459,7 +454,9 @@ impl EntitySchemaEntry {
     ) -> Self {
         if let Some(entry) = schema.get_entity_type(ety.as_ref()) {
             if let ValidatorEntityTypeKind::Enum(eids) = &entry.kind {
-                return EntitySchemaEntry::Enum(eids.iter().cloned().collect());
+                return EntitySchemaEntry::Enum(
+                    eids.into_iter().map(|e| e.as_ref().into()).collect(),
+                );
             }
         }
 

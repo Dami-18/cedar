@@ -145,49 +145,38 @@ impl From<RawCedarValueJson> for CedarValueJson {
                 let values = &r.values;
                 if values.len() == 1 {
                     match values.iter().map(|(k, v)| (k.as_str(), v)).collect_vec()[..] {
-                        [("__extn", RawCedarValueJson::Record(r))] => {
-                            if r.values.len() >= 2 {
-                                if let Some(RawCedarValueJson::String(fn_name)) = r.values.get("fn")
-                                {
-                                    if let Some(arg) = r.values.get("arg") {
-                                        return Self::ExtnEscape {
-                                            __extn: FnAndArgs::Single {
-                                                ext_fn: fn_name.clone(),
-                                                arg: Box::new(arg.clone().into()),
-                                            },
-                                        };
-                                    }
-                                    if let Some(RawCedarValueJson::Set(args)) = r.values.get("args")
-                                    {
-                                        return Self::ExtnEscape {
-                                            __extn: FnAndArgs::Multi {
-                                                ext_fn: fn_name.clone(),
-                                                args: args
-                                                    .iter()
-                                                    .cloned()
-                                                    .map(Into::into)
-                                                    .collect(),
-                                            },
-                                        };
-                                    }
+                        [("__extn", RawCedarValueJson::Record(r))] if r.values.len() >= 2 => {
+                            if let Some(RawCedarValueJson::String(fn_name)) = r.values.get("fn") {
+                                if let Some(arg) = r.values.get("arg") {
+                                    return Self::ExtnEscape {
+                                        __extn: FnAndArgs::Single {
+                                            ext_fn: fn_name.clone(),
+                                            arg: Box::new(arg.clone().into()),
+                                        },
+                                    };
+                                }
+                                if let Some(RawCedarValueJson::Set(args)) = r.values.get("args") {
+                                    return Self::ExtnEscape {
+                                        __extn: FnAndArgs::Multi {
+                                            ext_fn: fn_name.clone(),
+                                            args: args.iter().cloned().map(Into::into).collect(),
+                                        },
+                                    };
                                 }
                             }
                         }
                         [("__expr", RawCedarValueJson::String(s))] => {
                             return Self::ExprEscape { __expr: s.clone() };
                         }
-                        [("__entity", RawCedarValueJson::Record(r))] => {
-                            if r.values.len() >= 2 {
-                                if let Some(RawCedarValueJson::String(ty)) = r.values.get("type") {
-                                    if let Some(RawCedarValueJson::String(id)) = r.values.get("id")
-                                    {
-                                        return Self::EntityEscape {
-                                            __entity: TypeAndId {
-                                                entity_type: ty.clone(),
-                                                id: id.clone(),
-                                            },
-                                        };
-                                    }
+                        [("__entity", RawCedarValueJson::Record(r))] if r.values.len() >= 2 => {
+                            if let Some(RawCedarValueJson::String(ty)) = r.values.get("type") {
+                                if let Some(RawCedarValueJson::String(id)) = r.values.get("id") {
+                                    return Self::EntityEscape {
+                                        __entity: TypeAndId {
+                                            entity_type: ty.clone(),
+                                            id: id.clone(),
+                                        },
+                                    };
                                 }
                             }
                         }
@@ -374,6 +363,54 @@ impl CedarValueJson {
         Self::EntityEscape {
             __entity: TypeAndId::from(euid.clone()),
         }
+    }
+
+    /// Compute the height of this value tree, defined as the number of
+    /// edges on the longest root-to-leaf path through nested
+    /// `CedarValueJson` nodes.
+    ///
+    /// Leaf nodes (`Bool`, `Long`, `String`, `Null`, `ExprEscape`, and `EntityEscape`)
+    /// have height 0.
+    /// An empty `Set` or empty `Record` also has height 0.
+    ///
+    /// For internal nodes (`Set`, `Record`, and `ExtnEscape`) with at least
+    /// one child, the height is 1 + the maximum height among all
+    /// children.
+    ///
+    /// Uses an iterative depth-first traversal rather than recursion.
+    pub fn height(&self) -> usize {
+        // Stack of (node, depth) pairs.
+        // Start with this node at depth 0.
+        let mut stack: Vec<(&CedarValueJson, usize)> = vec![(self, 0)];
+        let mut max_depth: usize = 0;
+        while let Some((val, depth)) = stack.pop() {
+            max_depth = max_depth.max(depth);
+            let child_depth = depth + 1;
+            match val {
+                Self::Bool(_)
+                | Self::Long(_)
+                | Self::String(_)
+                | Self::Null
+                | Self::ExprEscape { .. }
+                | Self::EntityEscape { .. } => {}
+                Self::Set(vals) => {
+                    for v in vals {
+                        stack.push((v, child_depth));
+                    }
+                }
+                Self::Record(rec) => {
+                    for (_, v) in rec {
+                        stack.push((v, child_depth));
+                    }
+                }
+                Self::ExtnEscape { __extn } => {
+                    for arg in __extn.args() {
+                        stack.push((arg, child_depth));
+                    }
+                }
+            }
+        }
+        max_depth
     }
 
     /// Convert this `CedarValueJson` into a Cedar "restricted expression"
@@ -1065,4 +1102,106 @@ pub enum ExtnValueJson {
     // This is listed last so that it has lowest priority when deserializing.
     // If one of the above forms fits, we use that.
     ImplicitConstructor(CedarValueJson),
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn height_leaf() {
+        assert_eq!(CedarValueJson::Bool(true).height(), 0);
+        assert_eq!(CedarValueJson::Long(42).height(), 0);
+        assert_eq!(CedarValueJson::String("hi".into()).height(), 0);
+        assert_eq!(CedarValueJson::Null.height(), 0);
+        assert_eq!(
+            CedarValueJson::ExprEscape {
+                __expr: "1 + 2".into()
+            }
+            .height(),
+            0
+        );
+        assert_eq!(
+            CedarValueJson::EntityEscape {
+                __entity: TypeAndId {
+                    entity_type: "User".into(),
+                    id: "alice".into(),
+                }
+            }
+            .height(),
+            0
+        );
+        assert_eq!(CedarValueJson::Set(vec![]).height(), 0);
+        assert_eq!(
+            CedarValueJson::Record(vec![].into_iter().collect()).height(),
+            0
+        );
+    }
+
+    #[test]
+    fn height_set() {
+        let val = CedarValueJson::Set(vec![CedarValueJson::Long(1), CedarValueJson::Long(2)]);
+        assert_eq!(val.height(), 1);
+    }
+
+    #[test]
+    fn height_record() {
+        let rec: JsonRecord = vec![("a".into(), CedarValueJson::Long(1))]
+            .into_iter()
+            .collect();
+        assert_eq!(CedarValueJson::Record(rec).height(), 1);
+    }
+
+    #[test]
+    fn height_nested_set() {
+        let inner = CedarValueJson::Set(vec![CedarValueJson::Long(1)]);
+        let outer = CedarValueJson::Set(vec![inner]);
+        assert_eq!(outer.height(), 2);
+    }
+
+    #[test]
+    fn height_asymmetric_set() {
+        let val = CedarValueJson::Set(vec![
+            CedarValueJson::Long(1),
+            CedarValueJson::Set(vec![CedarValueJson::Long(2)]),
+        ]);
+        assert_eq!(val.height(), 2);
+    }
+
+    #[test]
+    fn height_extn_escape() {
+        let val = CedarValueJson::ExtnEscape {
+            __extn: FnAndArgs::Single {
+                ext_fn: "decimal".into(),
+                arg: Box::new(CedarValueJson::String("1.0".into())),
+            },
+        };
+        assert_eq!(val.height(), 1);
+    }
+
+    #[test]
+    fn height_extn_escape_multi() {
+        let val = CedarValueJson::ExtnEscape {
+            __extn: FnAndArgs::Multi {
+                ext_fn: "foo".into(),
+                args: vec![CedarValueJson::Long(1), CedarValueJson::Long(2)],
+            },
+        };
+        assert_eq!(val.height(), 1);
+    }
+
+    #[test]
+    fn height_nested_composites() {
+        // Record containing a Set containing an ExtnEscape
+        let extn = CedarValueJson::ExtnEscape {
+            __extn: FnAndArgs::Single {
+                ext_fn: "decimal".into(),
+                arg: Box::new(CedarValueJson::String("1.0".into())),
+            },
+        };
+        let set = CedarValueJson::Set(vec![extn]);
+        let rec: JsonRecord = vec![("a".into(), set)].into_iter().collect();
+        let val = CedarValueJson::Record(rec);
+        assert_eq!(val.height(), 3);
+    }
 }

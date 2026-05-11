@@ -215,6 +215,22 @@ impl PolicySet {
         }
     }
 
+    /// Create a `PolicySet` containing a single policy.
+    pub fn singleton(p: Policy) -> Self {
+        let t = p.template_arc();
+
+        let templates = std::iter::once((t.id().clone(), t.clone())).collect();
+        let template_to_links_map =
+            std::iter::once((t.id().clone(), std::iter::once(p.id().clone()).collect())).collect();
+        let links = std::iter::once((p.id().clone(), p)).collect();
+
+        Self {
+            templates,
+            links,
+            template_to_links_map,
+        }
+    }
+
     /// Add a `Policy` to the `PolicySet`.
     pub fn add(&mut self, policy: Policy) -> Result<(), PolicySetError> {
         let t = policy.template_arc();
@@ -249,9 +265,7 @@ impl PolicySet {
         if let Some(ventry) = template_ventry {
             self.template_to_links_map.insert(
                 t.id().clone(),
-                vec![policy.id().clone()]
-                    .into_iter()
-                    .collect::<LinkedHashSet<PolicyID>>(),
+                std::iter::once(policy.id().clone()).collect(),
             );
             ventry.insert(t);
         } else {
@@ -806,6 +820,43 @@ mod test {
                 assert_eq!(id, PolicyID::from_string("t"))
             }
         }
+    }
+
+    #[test]
+    fn policy_set_singleton_static() {
+        let policy: Policy = parser::parse_policy(
+            Some(PolicyID::from_string("id")),
+            "permit(principal,action,resource);",
+        )
+        .unwrap()
+        .into();
+
+        let pset_singleton = PolicySet::singleton(policy.clone());
+        let mut pset_add = PolicySet::new();
+        pset_add.add(policy).unwrap();
+        assert_eq!(pset_singleton, pset_add);
+    }
+
+    #[test]
+    fn policy_set_singleton_link() {
+        let template = Arc::new(
+            parser::parse_policy_or_template(
+                Some(PolicyID::from_string("t")),
+                "permit(principal == ?principal, action, resource);",
+            )
+            .expect("Failed to parse"),
+        );
+        let env1 = HashMap::from([(
+            SlotId::principal(),
+            r#"Test::"test1""#.parse().expect("Failed to parse"),
+        )]);
+        let policy =
+            Template::link(template, PolicyID::from_string("link"), env1).expect("Failed to link");
+
+        let pset_singleton = PolicySet::singleton(policy.clone());
+        let mut pset_add = PolicySet::new();
+        pset_add.add(policy).unwrap();
+        assert_eq!(pset_singleton, pset_add);
     }
 
     #[test]

@@ -19,6 +19,7 @@
 
 use std::collections::{hash_map::Entry, HashMap, HashSet};
 
+use crate::ast::Eid;
 use crate::parser::Loc;
 use crate::{
     ast::{EntityType, EntityUID, InternalName, Name, UnreservedId},
@@ -476,7 +477,7 @@ pub enum EntityTypeFragment<N> {
         /// fragment).
         tags: Option<json_schema::Type<N>>,
     },
-    Enum(NonEmpty<SmolStr>),
+    Enum(NonEmpty<Eid>),
 }
 
 impl<N> EntityTypeFragment<N> {
@@ -1026,21 +1027,19 @@ pub(crate) fn try_record_type_into_validator_type(
         #[cfg(not(feature = "extended-schema"))]
         let attr_loc = None;
         Ok(
-            parse_record_attributes(rty.attributes.into_iter(), extensions, attr_loc)?.map(
-                move |attrs| {
-                    LocatedType::new_with_loc(
-                        Type::record_with_attributes(
-                            attrs,
-                            if rty.additional_attributes {
-                                OpenTag::OpenAttributes
-                            } else {
-                                OpenTag::ClosedAttributes
-                            },
-                        ),
-                        &loc,
-                    )
-                },
-            ),
+            parse_record_attributes(rty.attributes, extensions, attr_loc)?.map(move |attrs| {
+                LocatedType::new_with_loc(
+                    Type::record_with_attributes(
+                        attrs,
+                        if rty.additional_attributes {
+                            OpenTag::OpenAttributes
+                        } else {
+                            OpenTag::ClosedAttributes
+                        },
+                    ),
+                    &loc,
+                )
+            }),
         )
     }
 }

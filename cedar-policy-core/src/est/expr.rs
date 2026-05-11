@@ -962,6 +962,122 @@ impl Expr {
             }
         }
     }
+
+    /// Compute the height of this expression tree, defined as the number of
+    /// edges on the longest root-to-leaf path through nested `Expr` and
+    /// `CedarValueJson` nodes.
+    ///
+    /// Leaf nodes (`Var`, `Slot`, etc.) have height 0.
+    /// An empty `Set` or empty `Record` expression also has height 0.
+    ///
+    /// For internal nodes (`Not`, `Eq`, `If`, `Set`, `Record`, etc.)
+    /// with at least one child, the height is 1 + the maximum height among
+    /// all children.
+    ///
+    /// Uses an iterative depth-first traversal rather than recursion.
+    pub fn height(&self) -> usize {
+        // Stack of (node, depth) pairs.
+        // Start with this expression at depth 0.
+        let mut stack: Vec<(&Expr, usize)> = vec![(self, 0)];
+        let mut max_depth: usize = 0;
+
+        while let Some((expr, depth)) = stack.pop() {
+            max_depth = max_depth.max(depth);
+            let child_depth = depth + 1;
+
+            match expr {
+                Expr::ExprNoExt(e) => match e {
+                    ExprNoExt::Value(v) => {
+                        // A literal value may itself be a nested structure
+                        // (e.g., a set of records). Use CedarValueJson::height()
+                        // to account for its internal depth.
+                        let value_height = depth + v.height();
+                        max_depth = max_depth.max(value_height);
+                    }
+                    ExprNoExt::Var(_) | ExprNoExt::Slot(_) => {}
+                    #[cfg(feature = "tolerant-ast")]
+                    ExprNoExt::Error(_) => {}
+                    ExprNoExt::Not { arg }
+                    | ExprNoExt::Neg { arg }
+                    | ExprNoExt::IsEmpty { arg } => {
+                        stack.push((arg, child_depth));
+                    }
+                    ExprNoExt::Eq { left, right }
+                    | ExprNoExt::NotEq { left, right }
+                    | ExprNoExt::In { left, right }
+                    | ExprNoExt::Less { left, right }
+                    | ExprNoExt::LessEq { left, right }
+                    | ExprNoExt::Greater { left, right }
+                    | ExprNoExt::GreaterEq { left, right }
+                    | ExprNoExt::And { left, right }
+                    | ExprNoExt::Or { left, right }
+                    | ExprNoExt::Add { left, right }
+                    | ExprNoExt::Sub { left, right }
+                    | ExprNoExt::Mul { left, right }
+                    | ExprNoExt::Contains { left, right }
+                    | ExprNoExt::ContainsAll { left, right }
+                    | ExprNoExt::ContainsAny { left, right }
+                    | ExprNoExt::GetTag { left, right }
+                    | ExprNoExt::HasTag { left, right } => {
+                        stack.push((left, child_depth));
+                        stack.push((right, child_depth));
+                    }
+                    ExprNoExt::GetAttr { left, .. } => {
+                        stack.push((left, child_depth));
+                    }
+                    ExprNoExt::HasAttr(repr) => match repr {
+                        HasAttrRepr::Simple { left, .. } | HasAttrRepr::Extended { left, .. } => {
+                            // For the `Extended` variant, the attr list is
+                            // flat (a list of strings), not nested sub-expressions,
+                            // so only `left` contributes to EST height.
+                            // Note that the AST desugars this into a
+                            // nested tree of `and`/`hasAttr`/`getAttr`
+                            // nodes, which will result in a deeper tree.
+                            // However, the conversion to the AST uses an iterator + fold.
+                            stack.push((left, child_depth));
+                        }
+                    },
+                    ExprNoExt::Like { left, .. } => {
+                        stack.push((left, child_depth));
+                    }
+                    ExprNoExt::Is { left, in_expr, .. } => {
+                        stack.push((left, child_depth));
+                        if let Some(in_e) = in_expr {
+                            stack.push((in_e, child_depth));
+                        }
+                    }
+                    ExprNoExt::If {
+                        cond_expr,
+                        then_expr,
+                        else_expr,
+                    } => {
+                        stack.push((cond_expr, child_depth));
+                        stack.push((then_expr, child_depth));
+                        stack.push((else_expr, child_depth));
+                    }
+                    ExprNoExt::Set(elements) => {
+                        for el in elements {
+                            stack.push((el, child_depth));
+                        }
+                    }
+                    ExprNoExt::Record(map) => {
+                        for v in map.values() {
+                            stack.push((v, child_depth));
+                        }
+                    }
+                },
+                Expr::ExtFuncCall(ExtFuncCall { call }) => {
+                    for args in call.values() {
+                        for arg in args {
+                            stack.push((arg, child_depth));
+                        }
+                    }
+                }
+            }
+        }
+
+        max_depth
+    }
 }
 
 impl Expr {
@@ -2086,5 +2202,361 @@ mod test {
             attr: nonempty!["user".into(), "profile".into(), "email".into()],
         }));
         assert_eq!(format!("{expr}"), "context has user.profile.email");
+    }
+
+    #[test]
+    fn height_leaf() {
+        let expr = Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Long(1)));
+        assert_eq!(expr.height(), 0);
+        let expr = Expr::ExprNoExt(ExprNoExt::Var(ast::Var::Principal));
+        assert_eq!(expr.height(), 0);
+    }
+
+    #[test]
+    fn height_unary() {
+        let expr = Expr::ExprNoExt(ExprNoExt::Not {
+            arg: Arc::new(Expr::ExprNoExt(ExprNoExt::Var(ast::Var::Principal))),
+        });
+        assert_eq!(expr.height(), 1);
+    }
+
+    #[test]
+    fn height_binary() {
+        let expr = Expr::ExprNoExt(ExprNoExt::Eq {
+            left: Arc::new(Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Long(1)))),
+            right: Arc::new(Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Long(2)))),
+        });
+        assert_eq!(expr.height(), 1);
+    }
+
+    #[test]
+    fn height_nested() {
+        let expr = Expr::ExprNoExt(ExprNoExt::Not {
+            arg: Arc::new(Expr::ExprNoExt(ExprNoExt::Not {
+                arg: Arc::new(Expr::ExprNoExt(ExprNoExt::Var(ast::Var::Principal))),
+            })),
+        });
+        assert_eq!(expr.height(), 2);
+    }
+
+    #[test]
+    fn height_asymmetric() {
+        let deep_left = Expr::ExprNoExt(ExprNoExt::Not {
+            arg: Arc::new(Expr::ExprNoExt(ExprNoExt::Not {
+                arg: Arc::new(Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Long(1)))),
+            })),
+        });
+        let expr = Expr::ExprNoExt(ExprNoExt::Eq {
+            left: Arc::new(deep_left),
+            right: Arc::new(Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Long(2)))),
+        });
+        assert_eq!(expr.height(), 3);
+    }
+
+    #[test]
+    fn height_if_then_else() {
+        let expr = Expr::ExprNoExt(ExprNoExt::If {
+            cond_expr: Arc::new(Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Bool(
+                true,
+            )))),
+            then_expr: Arc::new(Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Long(1)))),
+            else_expr: Arc::new(Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Long(2)))),
+        });
+        assert_eq!(expr.height(), 1);
+    }
+
+    #[test]
+    fn height_set() {
+        let expr = Expr::ExprNoExt(ExprNoExt::Set(vec![
+            Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Long(1))),
+            Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Long(2))),
+        ]));
+        assert_eq!(expr.height(), 1);
+    }
+
+    #[test]
+    fn height_empty_set() {
+        let expr = Expr::ExprNoExt(ExprNoExt::Set(vec![]));
+        assert_eq!(expr.height(), 0);
+    }
+
+    #[test]
+    fn height_record() {
+        let mut map = BTreeMap::new();
+        map.insert(
+            "a".into(),
+            Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Long(1))),
+        );
+        let expr = Expr::ExprNoExt(ExprNoExt::Record(map));
+        assert_eq!(expr.height(), 1);
+    }
+
+    #[test]
+    fn height_neg() {
+        // Simple negation of a leaf has height 1
+        let expr = Expr::ExprNoExt(ExprNoExt::Neg {
+            arg: Arc::new(Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Long(5)))),
+        });
+        assert_eq!(expr.height(), 1);
+
+        // Nested negation has height 2
+        let expr = Expr::ExprNoExt(ExprNoExt::Neg {
+            arg: Arc::new(Expr::ExprNoExt(ExprNoExt::Neg {
+                arg: Arc::new(Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Long(5)))),
+            })),
+        });
+        assert_eq!(expr.height(), 2);
+    }
+
+    #[test]
+    fn height_not_eq() {
+        let expr = Expr::ExprNoExt(ExprNoExt::NotEq {
+            left: Arc::new(Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Long(1)))),
+            right: Arc::new(Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Long(2)))),
+        });
+        assert_eq!(expr.height(), 1);
+    }
+
+    #[test]
+    fn height_in() {
+        let expr = Expr::ExprNoExt(ExprNoExt::In {
+            left: Arc::new(Expr::ExprNoExt(ExprNoExt::Var(ast::Var::Principal))),
+            right: Arc::new(Expr::ExprNoExt(ExprNoExt::Var(ast::Var::Resource))),
+        });
+        assert_eq!(expr.height(), 1);
+    }
+
+    #[test]
+    fn height_less() {
+        let expr = Expr::ExprNoExt(ExprNoExt::Less {
+            left: Arc::new(Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Long(1)))),
+            right: Arc::new(Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Long(2)))),
+        });
+        assert_eq!(expr.height(), 1);
+    }
+
+    #[test]
+    fn height_less_eq() {
+        let expr = Expr::ExprNoExt(ExprNoExt::LessEq {
+            left: Arc::new(Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Long(1)))),
+            right: Arc::new(Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Long(2)))),
+        });
+        assert_eq!(expr.height(), 1);
+    }
+
+    #[test]
+    fn height_greater() {
+        let expr = Expr::ExprNoExt(ExprNoExt::Greater {
+            left: Arc::new(Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Long(2)))),
+            right: Arc::new(Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Long(1)))),
+        });
+        assert_eq!(expr.height(), 1);
+    }
+
+    #[test]
+    fn height_greater_eq() {
+        let expr = Expr::ExprNoExt(ExprNoExt::GreaterEq {
+            left: Arc::new(Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Long(2)))),
+            right: Arc::new(Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Long(1)))),
+        });
+        assert_eq!(expr.height(), 1);
+    }
+
+    #[test]
+    fn height_and() {
+        let expr = Expr::ExprNoExt(ExprNoExt::And {
+            left: Arc::new(Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Bool(
+                true,
+            )))),
+            right: Arc::new(Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Bool(
+                false,
+            )))),
+        });
+        assert_eq!(expr.height(), 1);
+    }
+
+    #[test]
+    fn height_or() {
+        let expr = Expr::ExprNoExt(ExprNoExt::Or {
+            left: Arc::new(Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Bool(
+                true,
+            )))),
+            right: Arc::new(Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Bool(
+                false,
+            )))),
+        });
+        assert_eq!(expr.height(), 1);
+    }
+
+    #[test]
+    fn height_add() {
+        let expr = Expr::ExprNoExt(ExprNoExt::Add {
+            left: Arc::new(Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Long(1)))),
+            right: Arc::new(Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Long(2)))),
+        });
+        assert_eq!(expr.height(), 1);
+    }
+
+    #[test]
+    fn height_sub() {
+        let expr = Expr::ExprNoExt(ExprNoExt::Sub {
+            left: Arc::new(Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Long(3)))),
+            right: Arc::new(Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Long(1)))),
+        });
+        assert_eq!(expr.height(), 1);
+    }
+
+    #[test]
+    fn height_mul() {
+        let expr = Expr::ExprNoExt(ExprNoExt::Mul {
+            left: Arc::new(Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Long(2)))),
+            right: Arc::new(Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Long(3)))),
+        });
+        assert_eq!(expr.height(), 1);
+    }
+
+    #[test]
+    fn height_contains() {
+        let expr = Expr::ExprNoExt(ExprNoExt::Contains {
+            left: Arc::new(Expr::ExprNoExt(ExprNoExt::Set(vec![Expr::ExprNoExt(
+                ExprNoExt::Value(CedarValueJson::Long(1)),
+            )]))),
+            right: Arc::new(Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Long(1)))),
+        });
+        assert_eq!(expr.height(), 2);
+    }
+
+    #[test]
+    fn height_contains_all() {
+        let expr = Expr::ExprNoExt(ExprNoExt::ContainsAll {
+            left: Arc::new(Expr::ExprNoExt(ExprNoExt::Var(ast::Var::Context))),
+            right: Arc::new(Expr::ExprNoExt(ExprNoExt::Set(vec![]))),
+        });
+        assert_eq!(expr.height(), 1);
+    }
+
+    #[test]
+    fn height_contains_any() {
+        let expr = Expr::ExprNoExt(ExprNoExt::ContainsAny {
+            left: Arc::new(Expr::ExprNoExt(ExprNoExt::Var(ast::Var::Context))),
+            right: Arc::new(Expr::ExprNoExt(ExprNoExt::Set(vec![]))),
+        });
+        assert_eq!(expr.height(), 1);
+    }
+
+    #[test]
+    fn height_get_tag() {
+        let expr = Expr::ExprNoExt(ExprNoExt::GetTag {
+            left: Arc::new(Expr::ExprNoExt(ExprNoExt::Var(ast::Var::Principal))),
+            right: Arc::new(Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::String(
+                "tag_name".into(),
+            )))),
+        });
+        assert_eq!(expr.height(), 1);
+    }
+
+    #[test]
+    fn height_has_tag() {
+        let expr = Expr::ExprNoExt(ExprNoExt::HasTag {
+            left: Arc::new(Expr::ExprNoExt(ExprNoExt::Var(ast::Var::Principal))),
+            right: Arc::new(Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::String(
+                "tag_name".into(),
+            )))),
+        });
+        assert_eq!(expr.height(), 1);
+    }
+
+    #[test]
+    fn height_get_attr() {
+        let expr = Expr::ExprNoExt(ExprNoExt::GetAttr {
+            left: Arc::new(Expr::ExprNoExt(ExprNoExt::Var(ast::Var::Context))),
+            attr: "foo".into(),
+        });
+        assert_eq!(expr.height(), 1);
+    }
+
+    #[test]
+    fn height_has_attr() {
+        // Simple HasAttr
+        let expr = Expr::ExprNoExt(ExprNoExt::HasAttr(HasAttrRepr::Simple {
+            left: Arc::new(Expr::ExprNoExt(ExprNoExt::Var(ast::Var::Context))),
+            attr: "foo".into(),
+        }));
+        assert_eq!(expr.height(), 1);
+
+        // Extended HasAttr
+        use nonempty::nonempty;
+        let expr = Expr::ExprNoExt(ExprNoExt::HasAttr(HasAttrRepr::Extended {
+            left: Arc::new(Expr::ExprNoExt(ExprNoExt::Var(ast::Var::Context))),
+            attr: nonempty!["user".into(), "profile".into()],
+        }));
+        assert_eq!(expr.height(), 1);
+    }
+
+    #[test]
+    fn height_like() {
+        let expr = Expr::ExprNoExt(ExprNoExt::Like {
+            left: Arc::new(Expr::ExprNoExt(ExprNoExt::Var(ast::Var::Principal))),
+            pattern: vec![PatternElem::Wildcard],
+        });
+        assert_eq!(expr.height(), 1);
+    }
+
+    #[test]
+    fn height_is() {
+        // Is without in_expr
+        let expr = Expr::ExprNoExt(ExprNoExt::Is {
+            left: Arc::new(Expr::ExprNoExt(ExprNoExt::Var(ast::Var::Principal))),
+            entity_type: "User".into(),
+            in_expr: None,
+        });
+        assert_eq!(expr.height(), 1);
+
+        // Is with in_expr
+        let expr = Expr::ExprNoExt(ExprNoExt::Is {
+            left: Arc::new(Expr::ExprNoExt(ExprNoExt::Var(ast::Var::Principal))),
+            entity_type: "User".into(),
+            in_expr: Some(Arc::new(Expr::ExprNoExt(ExprNoExt::Var(
+                ast::Var::Resource,
+            )))),
+        });
+        assert_eq!(expr.height(), 1);
+
+        // Is with deeper in_expr
+        let expr = Expr::ExprNoExt(ExprNoExt::Is {
+            left: Arc::new(Expr::ExprNoExt(ExprNoExt::Var(ast::Var::Principal))),
+            entity_type: "User".into(),
+            in_expr: Some(Arc::new(Expr::ExprNoExt(ExprNoExt::Not {
+                arg: Arc::new(Expr::ExprNoExt(ExprNoExt::Var(ast::Var::Resource))),
+            }))),
+        });
+        assert_eq!(expr.height(), 2);
+    }
+
+    #[test]
+    fn height_ext_func_call() {
+        // ExtFuncCall with a leaf argument has height 1
+        let expr = Expr::ExtFuncCall(ExtFuncCall {
+            call: HashMap::from([(
+                "ip".to_smolstr(),
+                vec![Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::String(
+                    "127.0.0.1".into(),
+                )))],
+            )]),
+        });
+        assert_eq!(expr.height(), 1);
+
+        // ExtFuncCall with a nested argument has height 2
+        let expr = Expr::ExtFuncCall(ExtFuncCall {
+            call: HashMap::from([(
+                "ip".to_smolstr(),
+                vec![Expr::ExprNoExt(ExprNoExt::Not {
+                    arg: Arc::new(Expr::ExprNoExt(ExprNoExt::Value(CedarValueJson::Bool(
+                        true,
+                    )))),
+                })],
+            )]),
+        });
+        assert_eq!(expr.height(), 2);
     }
 }

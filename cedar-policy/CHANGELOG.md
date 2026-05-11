@@ -14,9 +14,19 @@ Starting with version 3.2.4, changes marked with a star (*) are _language breaki
 
 ### Added
 
-- Public syntax tree representation for `Policy`, `Template` and `PolicySet` allowing programmatic manipulation of Cedar syntax (#816, #366).
+- Public syntax tree (`pst`) module for programmatic construction, inspection, and manipulation of Cedar policies. Accessible via `to_pst()` / `try_into_pst()` / `from_pst()` on `Policy`, `Template`, and `PolicySet`. `try_into_pst()` consumes the value to avoid cloning. TPE residual policies can be converted to PST for structured inspection of residual expressions. Third-party types used in PST fields (`SmolStr`, `LinkedHashMap`, `NonEmpty`) are re-exported from the `pst` module. (#816, #366)
+- The Type-aware partial evaluation (TPE) experimental feature now supports template-linked policies. This would previously return a `SlotNotSupportedError` error.
+  This error variant is removed and replaced with `UnlinkedSlotError`, occurring only when slot in a linked policy is not bound. (#2314).
 
-## [4.10.0] - Coming soon
+### Fixed
+
+- Improved Cedar schema parse help for two common syntax mistakes: forgetting `appliesTo` before an action block, and adding `;` after a namespace declaration. (#1043, #1044)
+- `FunctionArgumentValidation` errors now include a help message describing the expected format for extension function arguments: `decimal`, `ip`, `datetime`, and `duration`. (#834)
+- Serialization of residual policies with `error()` nodes does not fail, instead results in JSON with `{"error": []}`. (#2202)
+- Fixed conversion from `protobuf` policy sets to public type for policy sets containing templates and template-linked policies. (#2330)
+- Fixed deserialization from protobuf of entity and context attributes containing extension values. (#2344)
+
+## [4.10.0] - 2026-04-23
 
 Cedar Language Version: 4.5
 
@@ -1181,7 +1191,8 @@ Cedar Language Version: 2.0
 Cedar Language Version: 2.0
 - Initial release of `cedar-policy`.
 
-[Unreleased]: https://github.com/cedar-policy/cedar/compare/v4.9.1...main
+[Unreleased]: https://github.com/cedar-policy/cedar/compare/v4.10.0...main
+[4.10.0]: https://github.com/cedar-policy/cedar/compare/v4.9.1...v4.10.0
 [4.9.1]: https://github.com/cedar-policy/cedar/compare/v4.9.0...v4.9.1
 [4.9.0]: https://github.com/cedar-policy/cedar/compare/v4.8.2...v4.9.0
 [4.8.2]: https://github.com/cedar-policy/cedar/compare/v4.8.1...v4.8.2
