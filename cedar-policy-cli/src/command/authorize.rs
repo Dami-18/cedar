@@ -45,6 +45,9 @@ pub struct AuthorizeArgs {
     /// Time authorization and report timing information
     #[arg(short, long)]
     pub timing: bool,
+    /// Use the PolTree-based authorizer path
+    #[arg(long = "poltree")]
+    pub use_poltree: bool,
 }
 
 pub fn authorize(args: &AuthorizeArgs) -> CedarExitCode {
@@ -55,6 +58,7 @@ pub fn authorize(args: &AuthorizeArgs) -> CedarExitCode {
         &args.entities_file,
         &args.schema,
         args.timing,
+        args.use_poltree,
     );
     match ans {
         Ok(ans) => {
@@ -104,6 +108,7 @@ fn execute_request(
     entities_filename: impl AsRef<Path>,
     schema: &OptionalSchemaArgs,
     compute_duration: bool,
+    use_poltree: bool,
 ) -> Result<Response, Vec<Report>> {
     let mut errs = vec![];
     let policies = match policies.get_policy_set() {
@@ -130,15 +135,36 @@ fn execute_request(
     match request.get_request(schema.as_ref()) {
         Ok(request) if errs.is_empty() => {
             let authorizer = Authorizer::new();
-            let auth_start = Instant::now();
-            let ans = authorizer.is_authorized(&request, &policies, &entities);
-            let auth_dur = auth_start.elapsed();
-            if compute_duration {
-                println!(
-                    "Authorization Time (micro seconds) : {}",
-                    auth_dur.as_micros()
-                );
-            }
+            let ans = if use_poltree {
+                let tree_build_start = Instant::now();
+                let tree_authorizer = authorizer.prepare(&policies, &entities);
+                let tree_build_dur = tree_build_start.elapsed();
+                let tree_eval_start = Instant::now();
+                let response = tree_authorizer.is_authorized(&request);
+                let tree_eval_dur = tree_eval_start.elapsed();
+                if compute_duration {
+                    println!(
+                        "Tree Build Time (micro seconds) : {}",
+                        tree_build_dur.as_micros()
+                    );
+                    println!(
+                        "Tree Evaluation Time (micro seconds) : {}",
+                        tree_eval_dur.as_micros()
+                    );
+                }
+                response
+            } else {
+                let auth_start = Instant::now();
+                let response = authorizer.is_authorized(&request, &policies, &entities);
+                let auth_dur = auth_start.elapsed();
+                if compute_duration {
+                    println!(
+                        "Authorization Time (micro seconds) : {}",
+                        auth_dur.as_micros()
+                    );
+                }
+                response
+            };
             Ok(ans)
         }
         Ok(_) => Err(errs),
