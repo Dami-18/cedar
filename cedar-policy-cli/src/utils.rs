@@ -51,6 +51,81 @@ pub(crate) fn read_from_file_or_stdin(
     Ok(src_str)
 }
 
+const POLTREE_CACHE_VERSION: u32 = 1;
+
+fn policy_format_tag(policy_format: PolicyFormat) -> u8 {
+    match policy_format {
+        PolicyFormat::Cedar => 1,
+        PolicyFormat::Json => 2,
+    }
+}
+
+fn hash_file(path: &Path) -> Result<u64> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to open file {} for hashing", path.display()))?;
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    let mut buf = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buf)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to read file {} while hashing", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(hasher.digest())
+}
+
+fn hash_file_if_exists(path: &Path) -> Result<u64> {
+    if path.exists() {
+        hash_file(path)
+    } else {
+        Ok(0)
+    }
+}
+
+pub(crate) fn poltree_cache_path(
+    policies: &PoliciesArgs,
+    entities_filename: &Path,
+    schema_file: Option<&Path>,
+) -> Result<Option<std::path::PathBuf>> {
+    let Some(policy_file) = policies.policies_file.as_ref() else {
+        return Ok(None);
+    };
+
+    let policy_hash = hash_file(Path::new(policy_file))?;
+    let entities_hash = hash_file(entities_filename)?;
+    let schema_hash = match schema_file {
+        Some(path) => hash_file(path)?,
+        None => 0,
+    };
+    let template_hash = match policies.template_linked_file.as_ref() {
+        Some(path) => hash_file_if_exists(Path::new(path))?,
+        None => 0,
+    };
+
+    let policy_format = policy_format_tag(policies.policy_format);
+
+    let cache_dir = std::env::current_dir()
+        .into_diagnostic()
+        .wrap_err("failed to resolve current directory")?
+        .join("target")
+        .join(".cedar")
+        .join("poltree-cache");
+    std::fs::create_dir_all(&cache_dir)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to create cache directory {}", cache_dir.display()))?;
+
+    let file_name = format!(
+        "v{POLTREE_CACHE_VERSION}_pf{policy_format}_{policy_hash:016x}_{entities_hash:016x}_{schema_hash:016x}_{template_hash:016x}.bin"
+    );
+    Ok(Some(cache_dir.join(file_name)))
+}
+
 // Convenient wrapper around `read_from_file_or_stdin` to just read from a file
 fn read_from_file(filename: impl AsRef<Path>, context: &str) -> Result<String> {
     read_from_file_or_stdin(Some(&filename), context)
