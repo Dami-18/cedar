@@ -23,7 +23,6 @@ use serde::{Deserialize, Serialize};
 use smol_str::{SmolStr, ToSmolStr};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-// use rkyv::{Archive, Deserialize, Serialize};
 
 const SCOPE_PRINCIPAL_ATTR: &str = "__scope_principal";
 const SCOPE_RESOURCE_ATTR: &str = "__scope_resource";

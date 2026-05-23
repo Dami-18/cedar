@@ -1181,6 +1181,44 @@ impl TreeAuthorizer<'_> {
     }
 }
 
+/// A packaged authorizer that takes ownership of a `PolicySet` and `Entities`
+/// and utilizes a lazily-initialized shared caching mechanism (`OnceLock`) 
+/// under the hood. The `PolTree` execution logic is compiled exactly once
+/// upon the first incoming request, allowing developers to reap the benefits 
+/// of zero-friction performance natively.
+#[derive(Debug)]
+pub struct CachedAuthorizer {
+    policies: PolicySet,
+    entities: std::sync::Arc<cedar_policy_core::entities::Entities>,
+    cached_tree: std::sync::OnceLock<cedar_policy_core::poltree::PolTree>,
+}
+
+impl CachedAuthorizer {
+    /// Create a new `CachedAuthorizer` for the given `PolicySet` and `Entities`.
+    /// This defers building the evaluation tree until the first authorization query.
+    pub fn new(policies: PolicySet, entities: Entities) -> Self {
+        Self {
+            policies,
+            entities: std::sync::Arc::new(entities.0),
+            cached_tree: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Authorize a request. The first time this is invoked, it will compile and cache
+    /// the underlying `PolTree`. All subsequent calls will reuse the cached tree.
+    pub fn is_authorized(&self, request: &Request) -> Response {
+        let tree = self.cached_tree.get_or_init(|| {
+            cedar_policy_core::poltree::PolTree::from_policy_set_and_entities(
+                &self.policies.ast,
+                std::sync::Arc::clone(&self.entities),
+            )
+        });
+
+        let (decision, diagnostics) = tree.evaluate_request(&request.0, &self.entities);
+        Response::from(cedar_policy_core::authorizer::Response { decision, diagnostics })
+    }
+}
+
 /// Authorization response returned from the `Authorizer`
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Response {
