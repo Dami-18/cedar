@@ -33,3 +33,4 @@ cedar-integration-tests
 # Ignore stored policy and entities 
 entities.json
 policy.cedar
+requests.json
