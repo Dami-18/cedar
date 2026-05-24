@@ -395,6 +395,7 @@ dependencies = [
  "thiserror",
  "tsify",
  "wasm-bindgen",
+ "xxhash-rust",
 ]
 
 [[package]]

@@ -70,6 +70,7 @@ use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -1181,6 +1182,62 @@ impl TreeAuthorizer<'_> {
     }
 }
 
+const POLTREE_CACHE_VERSION: u32 = 1;
+const POLTREE_CACHE_POLICY_FORMAT: u8 = 1;
+
+fn hash_file(path: &Path) -> std::io::Result<u64> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    let mut buf = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(hasher.digest())
+}
+
+fn hash_file_if_exists(path: &Path) -> std::io::Result<u64> {
+    if path.exists() {
+        hash_file(path)
+    } else {
+        Ok(0)
+    }
+}
+
+fn poltree_cache_path(
+    policy_file: &Path,
+    entities_file: &Path,
+    schema_file: Option<&Path>,
+    template_links_file: Option<&Path>,
+) -> std::io::Result<PathBuf> {
+    let policy_hash = hash_file(policy_file)?;
+    let entities_hash = hash_file(entities_file)?;
+    let schema_hash = match schema_file {
+        Some(path) => hash_file(path)?,
+        None => 0,
+    };
+    let template_hash = match template_links_file {
+        Some(path) => hash_file_if_exists(path)?,
+        None => 0,
+    };
+
+    let cache_dir = std::env::current_dir()?
+        .join("target")
+        .join(".cedar")
+        .join("poltree-cache");
+    std::fs::create_dir_all(&cache_dir)?;
+
+    let file_name = format!(
+        "v{POLTREE_CACHE_VERSION}_pf{POLTREE_CACHE_POLICY_FORMAT}_\
+{policy_hash:016x}_{entities_hash:016x}_{schema_hash:016x}_{template_hash:016x}.bin"
+    );
+    Ok(cache_dir.join(file_name))
+}
+
 /// A packaged authorizer that takes ownership of a `PolicySet` and `Entities`
 /// and utilizes a lazily-initialized shared caching mechanism (`OnceLock`) 
 /// under the hood. The `PolTree` execution logic is compiled exactly once
@@ -1191,6 +1248,7 @@ pub struct CachedAuthorizer {
     policies: PolicySet,
     entities: std::sync::Arc<cedar_policy_core::entities::Entities>,
     cached_tree: std::sync::OnceLock<cedar_policy_core::poltree::PolTree>,
+    cache_path: Option<PathBuf>,
 }
 
 impl CachedAuthorizer {
@@ -1201,17 +1259,69 @@ impl CachedAuthorizer {
             policies,
             entities: std::sync::Arc::new(entities.0),
             cached_tree: std::sync::OnceLock::new(),
+            cache_path: None,
         }
+    }
+
+    /// Create a new `CachedAuthorizer` that uses a hash-derived PolTree cache on disk.
+    ///
+    /// The cache key is derived from the contents of the policy, entities, and optional
+    /// schema/template-link files. If any of those inputs change, a new cache file is used.
+    pub fn new_with_cache_files<P, E, S, T>(
+        policies: PolicySet,
+        entities: Entities,
+        policy_file: P,
+        entities_file: E,
+        schema_file: Option<S>,
+        template_links_file: Option<T>,
+    ) -> std::io::Result<Self>
+    where
+        P: AsRef<Path>,
+        E: AsRef<Path>,
+        S: AsRef<Path>,
+        T: AsRef<Path>,
+    {
+        let cache_path = poltree_cache_path(
+            policy_file.as_ref(),
+            entities_file.as_ref(),
+            schema_file.as_ref().map(AsRef::as_ref),
+            template_links_file.as_ref().map(AsRef::as_ref),
+        )?;
+        Ok(Self {
+            policies,
+            entities: std::sync::Arc::new(entities.0),
+            cached_tree: std::sync::OnceLock::new(),
+            cache_path: Some(cache_path),
+        })
     }
 
     /// Authorize a request. The first time this is invoked, it will compile and cache
     /// the underlying `PolTree`. All subsequent calls will reuse the cached tree.
     pub fn is_authorized(&self, request: &Request) -> Response {
         let tree = self.cached_tree.get_or_init(|| {
-            cedar_policy_core::poltree::PolTree::from_policy_set_and_entities(
-                &self.policies.ast,
-                std::sync::Arc::clone(&self.entities),
-            )
+            if let Some(cache_path) = self.cache_path.as_ref() {
+                if cache_path.exists() {
+                    if let Ok(bytes) = std::fs::read(cache_path) {
+                        if let Ok(polt) = postcard::from_bytes(&bytes) {
+                            return polt;
+                        }
+                    }
+                }
+
+                let tree = cedar_policy_core::poltree::PolTree::from_policy_set_and_entities(
+                    &self.policies.ast,
+                    std::sync::Arc::clone(&self.entities),
+                );
+                if let Ok(bytes) = postcard::to_stdvec(&tree) {
+                    let _ = std::fs::write(cache_path, bytes);
+                }
+                tree
+            } else {
+                cedar_policy_core::poltree::PolTree::from_policy_set_and_entities(
+                    &self.policies.ast,
+                    std::sync::Arc::clone(&self.entities),
+                )
+            }
         });
 
         let (decision, diagnostics) = tree.evaluate_request(&request.0, &self.entities);
