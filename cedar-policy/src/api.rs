@@ -1208,6 +1208,19 @@ fn hash_file_if_exists(path: &Path) -> std::io::Result<u64> {
     }
 }
 
+fn hash_string(data: &str) -> u64 {
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    hasher.update(data.as_bytes());
+    hasher.digest()
+}
+
+fn hash_string_if_some(data: Option<&str>) -> u64 {
+    match data {
+        Some(s) => hash_string(s),
+        None => 0,
+    }
+}
+
 fn poltree_cache_path(
     policy_file: &Path,
     entities_file: &Path,
@@ -1224,6 +1237,30 @@ fn poltree_cache_path(
         Some(path) => hash_file_if_exists(path)?,
         None => 0,
     };
+
+    let cache_dir = std::env::current_dir()?
+        .join("target")
+        .join(".cedar")
+        .join("poltree-cache");
+    std::fs::create_dir_all(&cache_dir)?;
+
+    let file_name = format!(
+        "v{POLTREE_CACHE_VERSION}_pf{POLTREE_CACHE_POLICY_FORMAT}_\
+{policy_hash:016x}_{entities_hash:016x}_{schema_hash:016x}_{template_hash:016x}.bin"
+    );
+    Ok(cache_dir.join(file_name))
+}
+
+fn poltree_cache_path_from_strings(
+    policy_str: &str,
+    entities_str: &str,
+    schema_str: Option<&str>,
+    template_links_str: Option<&str>,
+) -> std::io::Result<PathBuf> {
+    let policy_hash = hash_string(policy_str);
+    let entities_hash = hash_string(entities_str);
+    let schema_hash = hash_string_if_some(schema_str);
+    let template_hash = hash_string_if_some(template_links_str);
 
     let cache_dir = std::env::current_dir()?
         .join("target")
@@ -1286,6 +1323,33 @@ impl CachedAuthorizer {
             entities_file.as_ref(),
             schema_file.as_ref().map(AsRef::as_ref),
             template_links_file.as_ref().map(AsRef::as_ref),
+        )?;
+        Ok(Self {
+            policies,
+            entities: std::sync::Arc::new(entities.0),
+            cached_tree: std::sync::OnceLock::new(),
+            cache_path: Some(cache_path),
+        })
+    }
+
+    /// Create a new `CachedAuthorizer` that uses a hash-derived PolTree cache on disk,
+    /// hashing the raw string contents instead of requiring file paths.
+    ///
+    /// The cache key is derived from the string contents provided. If any of those inputs change,
+    /// a new cache file is used.
+    pub fn new_with_string_hash(
+        policies: PolicySet,
+        entities: Entities,
+        policy_str: &str,
+        entities_str: &str,
+        schema_str: Option<&str>,
+        template_links_str: Option<&str>,
+    ) -> std::io::Result<Self> {
+        let cache_path = poltree_cache_path_from_strings(
+            policy_str,
+            entities_str,
+            schema_str,
+            template_links_str,
         )?;
         Ok(Self {
             policies,
