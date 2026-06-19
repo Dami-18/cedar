@@ -24,7 +24,6 @@ use crate::parser::Loc;
 use crate::{
     ast::{EntityType, EntityUID, InternalName, Name, UnreservedId},
     extensions::Extensions,
-    fuzzy_match::fuzzy_search,
 };
 use itertools::Itertools;
 use nonempty::{nonempty, NonEmpty};
@@ -861,25 +860,15 @@ pub(crate) fn try_jsonschema_type_into_validator_type(
                     loc.as_ref(),
                 ))
             } else {
-                let suggested_replacement = fuzzy_search(
-                    &extension_type_name.to_string(),
-                    &extensions
-                        .ext_types()
-                        .map(|n| n.to_string())
-                        .collect::<Vec<_>>(),
-                );
                 Err(SchemaError::UnknownExtensionType(
-                    UnknownExtensionTypeError {
-                        actual: extension_type_name,
-                        suggested_replacement,
-                    },
+                    UnknownExtensionTypeError::new_with_suggestion(extension_type_name, extensions),
                 ))
             }
         }
-        json_schema::Type::CommonTypeRef { type_name, .. } => {
+        json_schema::Type::CommonTypeRef { type_name, loc } => {
             common_type_defs
                 .get(&type_name)
-                .cloned()
+                .map(|def| def.clone().with_loc(loc.as_ref()))
                 // We should always have `Some` here, because if the common type
                 // wasn't defined, that error should have been caught earlier,
                 // when the `json_schema::Type<InternalName>` was created by
@@ -897,9 +886,10 @@ pub(crate) fn try_jsonschema_type_into_validator_type(
             // First check if it's a common type, because in the edge case where
             // the name is both a valid common type name and a valid entity type
             // name, we give preference to the common type (see RFC 24).
-            match common_type_defs.get(&type_name) {
-                Some(def) => Ok(def.clone()),
-                None => {
+            common_type_defs
+                .get(&type_name)
+                .map(|def| Ok(def.clone().with_loc(loc.as_ref())))
+                .unwrap_or_else(|| {
                     // It wasn't a common type, so we assume it must be a valid
                     // entity type. Otherwise, we would have had an error earlier,
                     // when the `json_schema::Type<InternalName>` was created by
@@ -909,8 +899,7 @@ pub(crate) fn try_jsonschema_type_into_validator_type(
                         Type::named_entity_reference(internal_name_to_entity_type(type_name)?),
                         loc.as_ref(),
                     ))
-                }
-            }
+                })
         }
     }
 }

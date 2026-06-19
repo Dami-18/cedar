@@ -15,7 +15,7 @@ cedar-policy = { version = "=4.11.0", path = "../cedar-policy" }
 cedar-policy-formatter = { version = "=4.11.0", path = "../cedar-policy-formatter" }
 cedar-policy-symcc = { version = "0.5.0", path = "../cedar-policy-symcc", optional = true }
 clap = { version = "4", features = ["derive", "env"] }
-itertools = { version = "0.14", optional = true }
+itertools = { version = "0.15", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 postcard = {version = "1.0"}
@@ -50,6 +50,9 @@ insta = { version = "1.47.2", features = ["filters"] }
 [[bin]]
 name = "cedar"
 path = "src/main.rs"
+
+[package.metadata.dist]
+dist = true
 
 [lints]
 workspace = true

@@ -28,12 +28,13 @@ use crate::{
     transitive_closure::compute_tc,
 };
 use educe::Educe;
+use itertools::Itertools;
 use namespace_def::EntityTypeFragment;
 use nonempty::NonEmpty;
 #[cfg(feature = "extended-schema")]
 use smol_str::SmolStr;
 use smol_str::ToSmolStr;
-use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{hash_map::Entry, BTreeSet, HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -41,7 +42,7 @@ use crate::validator::{
     cedar_schema::SchemaWarning,
     json_schema,
     partition_nonempty::PartitionNonEmpty,
-    types::{Attributes, EntityKind, OpenTag, RequestEnv, Type},
+    types::{Attributes, EntityKind, OpenTag, RequestEnv, Type, TypeIterator},
     ValidationMode,
 };
 
@@ -57,6 +58,7 @@ mod raw_name;
 pub use raw_name::{ConditionalName, RawName, ReferenceType};
 pub(crate) mod err;
 use err::{schema_errors::*, *};
+mod to_json;
 
 /// A `ValidatorSchemaFragment` consists of any number (even 0) of
 /// `ValidatorNamespaceDef`s.
@@ -153,6 +155,16 @@ impl LocatedType {
             ty,
             #[cfg(feature = "extended-schema")]
             loc: _loc.cloned(),
+        }
+    }
+
+    /// Replace `self.loc` with `loc`. No-op if the `extended-schema` feature is
+    /// not enabled.
+    pub fn with_loc(self, _loc: Option<&Loc>) -> Self {
+        Self {
+            #[cfg(feature = "extended-schema")]
+            loc: _loc.cloned(),
+            ..self
         }
     }
 
@@ -622,17 +634,7 @@ impl ValidatorSchema {
             }
         }
 
-        // Add entity-type declarations for the `Action` type in each namespace
-        // that contains actions.  This allows schemas to, for instance, have
-        // attributes of type `Action` or `Set<Action>` etc.
-        let action_types: HashSet<InternalName> = all_defs
-            .action_defs
-            .iter()
-            .map(|action_def| action_def.entity_type().as_ref().as_ref().clone())
-            .collect();
-        for action_type in action_types {
-            all_defs.mark_as_defined_as_entity_type(action_type);
-        }
+        all_defs.add_action_entity_types();
 
         // Now use `all_defs` to resolve all [`ConditionalName`] type references
         // into fully-qualified [`InternalName`] references.
@@ -817,12 +819,11 @@ impl ValidatorSchema {
         compute_tc(&mut action_ids, true)?;
 
         #[cfg(feature = "extended-schema")]
-        let common_type_validators = common_types
+        let located_common_types = common_types
             .clone()
             .into_iter()
-            .filter(|ct| {
+            .filter(|(ct_name, _)| {
                 // Only collect common types that are not primitives and have location data
-                let ct_name = ct.0.clone();
                 ct_name.loc().is_some() && !Type::is_primitive(ct_name.basename().as_ref())
             })
             .map(|ct| LocatedCommonType::new(ct.0, ct.1))
@@ -846,7 +847,7 @@ impl ValidatorSchema {
             entity_types,
             action_ids,
             #[cfg(feature = "extended-schema")]
-            common_type_validators,
+            located_common_types,
             #[cfg(feature = "extended-schema")]
             validator_namespaces,
         ))
@@ -1076,6 +1077,27 @@ impl ValidatorSchema {
         })
     }
 
+    /// Returns an iterator over all leaf types reachable from entity attributes, tags, and
+    /// action contexts. Leaf types are all types except `Set` and `Record`, which are
+    /// traversed into automatically.
+    /// Note that a type is traversed multiple times if it is referenced multiple times; consumers
+    /// should use [`Itertools::unique`] when they care about not visiting a type multiple times.
+    fn leaf_types(&self) -> TypeIterator<'_> {
+        let mut stack: Vec<&Type> = Vec::new();
+        for ety in self.entity_types.values() {
+            for (_, attr) in ety.attributes().iter() {
+                stack.push(&attr.attr_type);
+            }
+            if let Some(tag_ty) = ety.tag_type() {
+                stack.push(tag_ty);
+            }
+        }
+        for action in self.action_ids.values() {
+            stack.push(action.context());
+        }
+        TypeIterator { stack }
+    }
+
     /// Construct an `Entity` object for each action in the schema
     pub fn action_entities(&self) -> std::result::Result<Entities, EntitiesError> {
         let extensions = Extensions::all_available();
@@ -1087,13 +1109,127 @@ impl ValidatorSchema {
         )
     }
 
+    /// Check that the types in the hierarchy are declared, and no enum entity types
+    /// appears as a descendant of another type.
+    fn check_hierarchy_wf(&self) -> std::result::Result<(), SchemaError> {
+        let mut undeclared_entities = Vec::new();
+        // Check for entities:
+        // - all descendants are declared entity types,
+        // - no enum entity type appears as a descendant of another type
+        for ety in self.entity_types.values() {
+            for descendant in &ety.descendants {
+                if let Some(desc_ety) = self.entity_types.get(descendant) {
+                    if matches!(desc_ety.kind, ValidatorEntityTypeKind::Enum(_)) {
+                        return Err(EnumEntityInHierarchyError {
+                            enum_type: descendant.clone(),
+                            parent_type: ety.name().clone(),
+                        }
+                        .into());
+                    }
+                } else {
+                    undeclared_entities.push(descendant.clone());
+                }
+            }
+        }
+        // Check actions: appliesTo references declared entity types, and
+        // descendants reference declared actions, and action entity types have
+        // basename `Action`
+        for action in self.action_ids.values() {
+            if !action.name().entity_type().is_action() {
+                return Err(InvalidActionTypeError {
+                    uid: action.name().clone(),
+                }
+                .into());
+            }
+            for ety in action.principals().chain(action.resources()) {
+                if !self.entity_types.contains_key(ety) {
+                    undeclared_entities.push(ety.clone());
+                }
+            }
+            for descendant in action.descendants() {
+                if !self.action_ids.contains_key(descendant) {
+                    return Err(UndeclaredActionsDescendantError {
+                        euids: NonEmpty::singleton(descendant.clone()),
+                    }
+                    .into());
+                }
+            }
+        }
+        if let Some(undeclared) = NonEmpty::from_vec(undeclared_entities) {
+            return Err(UndeclaredEntityTypesError { types: undeclared }.into());
+        }
+        Ok(())
+    }
+
+    /// Check that all entity types referenced in attribute/tag/context types are declared
+    fn check_references_wf(&self) -> std::result::Result<(), SchemaError> {
+        let mut undeclared = Vec::new();
+        for ty in self.leaf_types().unique() {
+            if let Type::Entity(EntityKind::Entity(lub)) = ty {
+                for e in lub.iter() {
+                    if !self.entity_types.contains_key(e) {
+                        undeclared.push(e.clone());
+                    }
+                }
+            }
+        }
+        if let Some(undeclared) = NonEmpty::from_vec(undeclared) {
+            return Err(UndeclaredEntityTypesError { types: undeclared }.into());
+        }
+        Ok(())
+    }
+
+    fn check_extension_types_wf(&self) -> std::result::Result<(), SchemaError> {
+        let extensions = Extensions::all_available();
+        let valid_ext_types: HashSet<_> = extensions.ext_types().collect();
+        for ty in self.leaf_types().unique() {
+            if let Type::ExtensionType { name } = ty {
+                if !valid_ext_types.contains(name) {
+                    return Err(SchemaError::UnknownExtensionType(
+                        UnknownExtensionTypeError::new_with_suggestion(name.clone(), extensions),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Validate that a schema is well-formed according to the rules of the schema language.
     /// This is useful when the schema has been constructed directly from Rust code,
     /// without going through the JSON or Cedar schema syntax, and thus may not have
     /// been checked for well-formedness by the JSON or Cedar schema parsers.
-    pub fn try_validate(self) -> std::result::Result<Self, SchemaError> {
-        // Implementation for validating schema well-formedness
-        // TODO: implement schema validation
+    //
+    // Note: The checks here partially overlap with `check_for_undeclared` and
+    // the TC computation in `from_schema_fragments`. We cannot reuse those
+    // directly because they are designed for the fragment-merging construction
+    // path (they expect `undeclared_parent_entities/actions` from inverting
+    // `memberOf`, unresolved common types, etc.). Here we operate on an
+    // already-constructed schema where types are fully resolved, so we use
+    // simpler checks tailored to that representation (and also cover tags,
+    // which `check_for_undeclared` does not inspect).
+    pub fn try_validate(mut self) -> std::result::Result<Self, SchemaError> {
+        self.check_hierarchy_wf()?;
+        self.check_references_wf()?;
+        self.check_extension_types_wf()?;
+        // Recompute transitive closure for entity types and actions,
+        // which also detects cycles in the action hierarchy.
+        compute_tc(&mut self.entity_types, false)
+            .map_err(|e| EntityTypeTransitiveClosureError::from(Box::new(e)))?;
+        compute_tc(&mut self.action_ids, true)?;
+        self.actions = Self::action_entities_iter(&self.action_ids)
+            .map(|e| (e.uid().clone(), Arc::new(e)))
+            .collect();
+        // RFC 70 shadowing checks
+        let all_defs = AllDefs {
+            entity_defs: self
+                .entity_types
+                .keys()
+                .map(|ety| ety.name().as_ref().clone())
+                .collect(),
+            common_defs: HashSet::new(),
+            action_defs: self.action_ids.keys().cloned().collect(),
+        };
+        all_defs.rfc_70_shadowing_checks()?;
         Ok(self)
     }
 }
@@ -1276,37 +1412,45 @@ impl AllDefs {
     ///
     /// [RFC 70]: https://github.com/cedar-policy/rfcs/blob/main/text/0070-disallow-empty-namespace-shadowing.md
     pub fn rfc_70_shadowing_checks(&self) -> Result<()> {
+        // Definitions which cannot be shadowed according to the RFC 70 rules.
+        // RFC 70 specifies that shadowing an entity typename with a common typename is OK, including in the empty namespace.
+        // do not throw an error if the shadowing name is something like `__cedar::String` "shadowing" an empty-namespace declaration of `String`
+        let illegal_shadowings: HashMap<_, _> = self
+            .entity_and_common_names()
+            .filter(|name| !name.is_unqualified() && !name.is_reserved())
+            .map(|n| (n.basename(), n))
+            .collect();
+
         for unqualified_name in self
             .entity_and_common_names()
             .filter(|name| name.is_unqualified())
         {
-            // `unqualified_name` is a definition in the empty namespace
-            if let Some(name) = self.entity_and_common_names().find(|name| {
-                !name.is_unqualified() // RFC 70 specifies that shadowing an entity typename with a common typename is OK, including in the empty namespace
-                && !name.is_reserved() // do not throw an error if the shadowing name is something like `__cedar::String` "shadowing" an empty-namespace declaration of `String`
-                && name.basename() == unqualified_name.basename()
-            }) {
+            if let Some(&shadowing) = illegal_shadowings.get(unqualified_name.basename()) {
                 return Err(TypeShadowingError {
                     shadowed_def: unqualified_name.clone(),
-                    shadowing_def: name.clone(),
+                    shadowing_def: shadowing.clone(),
                 }
                 .into());
             }
         }
+
+        // Action definitions which cannot be shadowed.
+        let illegal_action_shadowings: HashMap<_, _> = self
+            .action_defs
+            .iter()
+            .filter(|euid| !euid.entity_type().as_ref().is_unqualified())
+            .map(|euid| (euid.eid(), euid))
+            .collect();
+
         for unqualified_action in self
             .action_defs
             .iter()
             .filter(|euid| euid.entity_type().as_ref().is_unqualified())
         {
-            // `unqualified_action` is a definition in the empty namespace
-            if let Some(action) = self.action_defs.iter().find(|euid| {
-                !euid.entity_type().as_ref().is_unqualified() // do not throw an error for an action "shadowing" itself
-                // we do not need to check that the basenames are the same, because we assume they are both `Action`
-                && euid.eid() == unqualified_action.eid()
-            }) {
+            if let Some(&shadowing) = illegal_action_shadowings.get(unqualified_action.eid()) {
                 return Err(ActionShadowingError {
                     shadowed_def: unqualified_action.clone(),
-                    shadowing_def: action.clone(),
+                    shadowing_def: shadowing.clone(),
                 }
                 .into());
             }
@@ -1318,6 +1462,20 @@ impl AllDefs {
     /// in the [`AllDefs`].
     fn entity_and_common_names(&self) -> impl Iterator<Item = &InternalName> {
         self.entity_defs.iter().chain(self.common_defs.iter())
+    }
+
+    /// Add entity-type declarations for the `Action` type in each namespace
+    /// that contains actions.  This allows schemas to, for instance, have
+    /// attributes of type `Action` or `Set<Action>` etc.
+    pub(crate) fn add_action_entity_types(&mut self) {
+        let action_types: HashSet<InternalName> = self
+            .action_defs
+            .iter()
+            .map(|action_def| action_def.entity_type().as_ref().as_ref().clone())
+            .collect();
+        for action_type in action_types {
+            self.mark_as_defined_as_entity_type(action_type);
+        }
     }
 }
 
@@ -1475,73 +1633,6 @@ impl<'a> CommonTypeResolver<'a> {
         }
     }
 
-    // Substitute common type references in `ty` according to `resolve_table`.
-    // Resolved types will still have the source loc of `ty`, unless `ty` is
-    // exactly a common type reference, in which case they will have the source
-    // loc of the definition of that reference.
-    fn resolve_type(
-        resolve_table: &HashMap<&InternalName, json_schema::Type<InternalName>>,
-        ty: json_schema::Type<InternalName>,
-    ) -> Result<json_schema::Type<InternalName>> {
-        match ty {
-            json_schema::Type::CommonTypeRef { type_name, .. } => resolve_table
-                .get(&type_name)
-                .ok_or_else(|| CommonTypeInvariantViolationError { name: type_name }.into())
-                .cloned(),
-            json_schema::Type::Type {
-                ty: json_schema::TypeVariant::EntityOrCommon { type_name },
-                loc,
-            } => match resolve_table.get(&type_name) {
-                Some(def) => Ok(def.clone().with_loc(loc)),
-
-                None => Ok(json_schema::Type::Type {
-                    ty: json_schema::TypeVariant::Entity { name: type_name },
-                    loc,
-                }),
-            },
-            json_schema::Type::Type {
-                ty: json_schema::TypeVariant::Set { element },
-                loc,
-            } => Ok(json_schema::Type::Type {
-                ty: json_schema::TypeVariant::Set {
-                    element: Box::new(Self::resolve_type(resolve_table, *element)?),
-                },
-                loc,
-            }),
-            json_schema::Type::Type {
-                ty:
-                    json_schema::TypeVariant::Record(json_schema::RecordType {
-                        attributes,
-                        additional_attributes,
-                    }),
-                loc,
-            } => Ok(json_schema::Type::Type {
-                ty: json_schema::TypeVariant::Record(json_schema::RecordType {
-                    attributes: BTreeMap::from_iter(
-                        attributes
-                            .into_iter()
-                            .map(|(attr, attr_ty)| -> Result<_> {
-                                Ok((
-                                    attr,
-                                    json_schema::TypeOfAttribute {
-                                        required: attr_ty.required,
-                                        ty: Self::resolve_type(resolve_table, attr_ty.ty)?,
-                                        annotations: attr_ty.annotations,
-                                        #[cfg(feature = "extended-schema")]
-                                        loc: attr_ty.loc,
-                                    },
-                                ))
-                            })
-                            .partition_nonempty::<Vec<_>>()?,
-                    ),
-                    additional_attributes,
-                }),
-                loc,
-            }),
-            _ => Ok(ty),
-        }
-    }
-
     // Resolve common type references, returning a map from (fully-qualified)
     // [`InternalName`] of a common type to its [`Type`] definition
     fn resolve(
@@ -1552,8 +1643,6 @@ impl<'a> CommonTypeResolver<'a> {
             SchemaError::CycleInCommonTypeReferences(CycleInCommonTypeReferencesError { ty: n })
         })?;
 
-        let mut resolve_table: HashMap<&InternalName, json_schema::Type<InternalName>> =
-            HashMap::new();
         let mut tys: HashMap<&'a InternalName, LocatedType> = HashMap::new();
 
         for &name in sorted_names.iter() {
@@ -1562,13 +1651,8 @@ impl<'a> CommonTypeResolver<'a> {
                 reason = "`name.basename()` should be an existing common type id"
             )]
             let ty = self.defs.get(name).unwrap();
-            let substituted_ty = Self::resolve_type(&resolve_table, ty.clone())?;
-            resolve_table.insert(name, substituted_ty.clone());
-            let validator_type = try_jsonschema_type_into_validator_type(
-                substituted_ty,
-                extensions,
-                &HashMap::new(),
-            )?;
+            let validator_type =
+                try_jsonschema_type_into_validator_type(ty.clone(), extensions, &tys)?;
 
             tys.insert(name, validator_type);
         }

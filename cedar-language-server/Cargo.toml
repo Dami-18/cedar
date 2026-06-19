@@ -15,14 +15,14 @@ cedar-policy-core = { version = "=4.11.0", path = "../cedar-policy-core", featur
 cedar-policy-formatter = { version = "=4.11.0", path = "../cedar-policy-formatter", features = ["tolerant-ast"] }
 cedar-policy = { version = "=4.11.0", path = "../cedar-policy", features = ["tolerant-ast"]}
 anyhow = "1.0.102"
-itertools = "0.14.0"
+itertools = "0.15.0"
 miette = "7.4.0"
 ropey = "1.6.1"
 smol_str = "0.3"
 tracing = "0.1.44"
 serde = "1"
 serde_json = "1.0.150"
-regex = "1.12.2"
+regex = "1.12.4"
 tower-lsp-server = "0.23.0"
 
 # Dependencies needed only for the language server binary
