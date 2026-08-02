@@ -24,7 +24,7 @@ use crate::ast::*;
 use crate::entities::Entities;
 use crate::evaluator::Evaluator;
 use crate::extensions::Extensions;
-use crate::poltree::PolTree;
+use crate::poltree::{build_residual_policy_set, build_residual_policy_set_from_ids, PolTree};
 use itertools::{Either, Itertools};
 // use rkyv::{Archive, Deserialize, Serialize};
 use serde::{Deserialize, Serialize};
@@ -58,6 +58,11 @@ pub struct TreeAuthorizer<'a> {
     pset: &'a PolicySet,
     entities: Arc<Entities>,
     poltree: PolTree,
+    /// Policies the `PolTree` could not soundly represent (unindexable
+    /// conditions, `in`/slot scope constraints, or any `forbid`-effect
+    /// policy). Evaluated for real on every request and combined with the
+    /// tree's result -- see `TreeAuthorizer::is_authorized`.
+    residual: PolicySet,
 }
 
 /// Describes the possible Cedar error-handling modes.
@@ -88,27 +93,37 @@ impl Authorizer {
         entities: &Entities,
     ) -> TreeAuthorizer<'a> {
         let entities = Arc::new(entities.clone());
-        let poltree = PolTree::from_policy_set_and_entities(pset, Arc::clone(&entities));
+        let (poltree, residual_ids) =
+            PolTree::from_policy_set_and_entities(pset, Arc::clone(&entities));
+        let residual = build_residual_policy_set_from_ids(pset, &residual_ids);
         TreeAuthorizer {
             authorizer: self,
             pset,
             entities,
             poltree,
+            residual,
         }
     }
 
     /// Build reusable authorization context using a prebuilt [`PolTree`].
+    ///
+    /// The serialized `PolTree` format does not persist which policies were
+    /// excluded as residual, so that split is recomputed here from `pset` and
+    /// `entities` -- this is a cheap, entities-classification-only pass (see
+    /// `residual_policy_ids`), not a full tree rebuild.
     pub fn prepare_with_poltree<'a>(
         &'a self,
         pset: &'a PolicySet,
         entities: &Entities,
         poltree: PolTree,
     ) -> TreeAuthorizer<'a> {
+        let residual = build_residual_policy_set(pset, entities);
         TreeAuthorizer {
             authorizer: self,
             pset,
             entities: Arc::new(entities.clone()),
             poltree,
+            residual,
         }
     }
 
@@ -206,13 +221,58 @@ impl Authorizer {
 }
 
 impl<'a> TreeAuthorizer<'a> {
-    /// Need to update this function and add actual tree traversal logic to check the request
     /// Authorize using the fixed prepared policy/entities context.
+    ///
+    /// Combines the `PolTree`'s fast-path decision (covering only fully
+    /// indexed, non-`forbid` policies) with a real evaluation of the residual
+    /// policies the tree could not soundly represent. A residual `forbid`
+    /// always overrides, matching normal Cedar permit/forbid semantics; an
+    /// `Allow` from either side is otherwise sufficient.
     pub fn is_authorized(&self, q: Request) -> Response {
-        let (decision, diagnostics) = self.poltree.evaluate_request(&q, &self.entities);
+        if self.residual.policies().next().is_none() {
+            // Fast path: nothing was excluded from the tree, so its decision
+            // is already the full answer.
+            let (decision, diagnostics) = self.poltree.evaluate_request(&q, &self.entities);
+            return Response {
+                decision,
+                diagnostics,
+            };
+        }
+
+        let (tree_decision, tree_diagnostics) = self.poltree.evaluate_request(&q, &self.entities);
+        let residual_partial =
+            self.authorizer
+                .is_authorized_core(q.clone(), &self.residual, self.entities.as_ref());
+
+        if !residual_partial.satisfied_forbids.is_empty() {
+            return Response {
+                decision: Decision::Deny,
+                diagnostics: Diagnostics {
+                    reason: residual_partial.satisfied_forbids.keys().cloned().collect(),
+                    errors: residual_partial.errors,
+                },
+            };
+        }
+
+        let residual_allow = !residual_partial.satisfied_permits.is_empty();
+        if tree_decision == Decision::Allow || residual_allow {
+            let mut reason = tree_diagnostics.reason;
+            reason.extend(residual_partial.satisfied_permits.keys().cloned());
+            return Response {
+                decision: Decision::Allow,
+                diagnostics: Diagnostics {
+                    reason,
+                    errors: residual_partial.errors,
+                },
+            };
+        }
+
         Response {
-            decision,
-            diagnostics,
+            decision: Decision::Deny,
+            diagnostics: Diagnostics {
+                reason: HashSet::new(),
+                errors: residual_partial.errors,
+            },
         }
     }
     /// Partial-evaluation variant using the fixed prepared policy/entities context.

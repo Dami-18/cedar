@@ -1284,7 +1284,14 @@ fn poltree_cache_path_from_strings(
 pub struct CachedAuthorizer {
     policies: PolicySet,
     entities: std::sync::Arc<cedar_policy_core::entities::Entities>,
-    cached_tree: std::sync::OnceLock<cedar_policy_core::poltree::PolTree>,
+    /// The tree, plus the policies it could not soundly represent (unindexable
+    /// conditions, `in`/slot scope constraints, or any `forbid`-effect policy)
+    /// and so must be evaluated for real on every request. See
+    /// `cedar_policy_core::poltree::PolTree::from_policy_set_and_entities`.
+    cached_tree: std::sync::OnceLock<(
+        cedar_policy_core::poltree::PolTree,
+        cedar_policy_core::ast::PolicySet,
+    )>,
     cache_path: Option<PathBuf>,
 }
 
@@ -1362,34 +1369,98 @@ impl CachedAuthorizer {
     /// Authorize a request. The first time this is invoked, it will compile and cache
     /// the underlying `PolTree`. All subsequent calls will reuse the cached tree.
     pub fn is_authorized(&self, request: &Request) -> Response {
-        let tree = self.cached_tree.get_or_init(|| {
+        let (tree, residual) = self.cached_tree.get_or_init(|| {
+            // Cache-hit path: the serialized `PolTree` doesn't persist which
+            // policies were excluded as residual, so recompute that split.
+            // This is a cheap, entities-classification-only pass -- see
+            // `residual_policy_ids` -- not a full tree rebuild.
             if let Some(cache_path) = self.cache_path.as_ref() {
                 if cache_path.exists() {
                     if let Ok(bytes) = std::fs::read(cache_path) {
                         if let Ok(polt) = postcard::from_bytes(&bytes) {
-                            return polt;
+                            let residual = cedar_policy_core::poltree::build_residual_policy_set(
+                                &self.policies.ast,
+                                &self.entities,
+                            );
+                            return (polt, residual);
                         }
                     }
                 }
 
-                let tree = cedar_policy_core::poltree::PolTree::from_policy_set_and_entities(
+                let (tree, residual_ids) =
+                    cedar_policy_core::poltree::PolTree::from_policy_set_and_entities(
+                        &self.policies.ast,
+                        std::sync::Arc::clone(&self.entities),
+                    );
+                let residual = cedar_policy_core::poltree::build_residual_policy_set_from_ids(
                     &self.policies.ast,
-                    std::sync::Arc::clone(&self.entities),
+                    &residual_ids,
                 );
                 if let Ok(bytes) = postcard::to_stdvec(&tree) {
                     let _ = std::fs::write(cache_path, bytes);
                 }
-                tree
+                (tree, residual)
             } else {
-                cedar_policy_core::poltree::PolTree::from_policy_set_and_entities(
+                let (tree, residual_ids) =
+                    cedar_policy_core::poltree::PolTree::from_policy_set_and_entities(
+                        &self.policies.ast,
+                        std::sync::Arc::clone(&self.entities),
+                    );
+                let residual = cedar_policy_core::poltree::build_residual_policy_set_from_ids(
                     &self.policies.ast,
-                    std::sync::Arc::clone(&self.entities),
-                )
+                    &residual_ids,
+                );
+                (tree, residual)
             }
         });
 
-        let (decision, diagnostics) = tree.evaluate_request(&request.0, &self.entities);
-        Response::from(cedar_policy_core::authorizer::Response { decision, diagnostics })
+        let (tree_decision, tree_diagnostics) = tree.evaluate_request(&request.0, &self.entities);
+
+        if residual.policies().next().is_none() {
+            // Fast path: nothing was excluded from the tree.
+            return Response::from(cedar_policy_core::authorizer::Response {
+                decision: tree_decision,
+                diagnostics: tree_diagnostics,
+            });
+        }
+
+        let real_authorizer = cedar_policy_core::authorizer::Authorizer::new();
+        let residual_partial = real_authorizer.is_authorized_core(
+            request.0.clone(),
+            residual,
+            &self.entities,
+        );
+
+        if !residual_partial.satisfied_forbids.is_empty() {
+            return Response::from(cedar_policy_core::authorizer::Response {
+                decision: cedar_policy_core::authorizer::Decision::Deny,
+                diagnostics: cedar_policy_core::authorizer::Diagnostics {
+                    reason: residual_partial.satisfied_forbids.keys().cloned().collect(),
+                    errors: residual_partial.errors,
+                },
+            });
+        }
+
+        let residual_allow = !residual_partial.satisfied_permits.is_empty();
+        if tree_decision == cedar_policy_core::authorizer::Decision::Allow || residual_allow {
+            let mut reason = tree_diagnostics.reason;
+            reason.extend(residual_partial.satisfied_permits.keys().cloned());
+            return Response::from(cedar_policy_core::authorizer::Response {
+                decision: cedar_policy_core::authorizer::Decision::Allow,
+                diagnostics: cedar_policy_core::authorizer::Diagnostics {
+                    reason,
+                    errors: residual_partial.errors,
+                },
+            });
+        }
+
+        Response::from(cedar_policy_core::authorizer::Response {
+            decision: cedar_policy_core::authorizer::Decision::Deny,
+            diagnostics: cedar_policy_core::authorizer::Diagnostics {
+                reason: std::collections::HashSet::new(),
+                errors: residual_partial.errors,
+            },
+        })
     }
 }
 

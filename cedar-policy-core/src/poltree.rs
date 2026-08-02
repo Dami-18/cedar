@@ -28,6 +28,44 @@ const SCOPE_PRINCIPAL_ATTR: &str = "__scope_principal";
 const SCOPE_RESOURCE_ATTR: &str = "__scope_resource";
 const SCOPE_ACTION_ATTR: &str = "__scope_action";
 
+// Non-scope (`when`-clause) constraints are indexed per-attribute-NAME, e.g.
+// "clearance". If a policy constrains `principal.clearance` and
+// `resource.clearance` separately (a common ABAC pattern -- compare a
+// principal's clearance to a resource's clearance), those are two distinct
+// facts about two different entities that happen to share an attribute name.
+// Indexing them under the same bare "clearance" key would make
+// `request_values_for_attr` union both entities' values into one membership
+// check, silently turning the policy's AND into an OR. These prefixes keep
+// principal-side and resource-side constraints on the same attribute name in
+// separate index keys.
+const PRINCIPAL_ATTR_PREFIX: &str = "__principal_attr_";
+const RESOURCE_ATTR_PREFIX: &str = "__resource_attr_";
+
+/// Build the namespaced index key for a principal-side or resource-side
+/// non-scope attribute constraint. See the module comment above.
+fn side_scoped_attr(is_principal: bool, attr: &SmolStr) -> SmolStr {
+    if is_principal {
+        SmolStr::from(format!("{PRINCIPAL_ATTR_PREFIX}{attr}"))
+    } else {
+        SmolStr::from(format!("{RESOURCE_ATTR_PREFIX}{attr}"))
+    }
+}
+
+/// Inverse of [`side_scoped_attr`]: given an index key, recover which side it
+/// came from (`true` = principal, `false` = resource) and the underlying
+/// entity attribute name. Returns `None` for keys that were never produced by
+/// `side_scoped_attr` (scope attributes, or raw entity-attribute-name keys
+/// that never got a matching policy constraint -- see `build_from_entities`).
+fn split_side_scoped_attr(attr: &str) -> Option<(bool, &str)> {
+    if let Some(rest) = attr.strip_prefix(PRINCIPAL_ATTR_PREFIX) {
+        Some((true, rest))
+    } else if let Some(rest) = attr.strip_prefix(RESOURCE_ATTR_PREFIX) {
+        Some((false, rest))
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Constraint {
     attr: SmolStr,
@@ -68,94 +106,160 @@ fn entities_with_type(entities: &Entities, entity_type: &EntityType) -> HashSet<
         .collect()
 }
 
-fn request_scope_literal(request: &Request, attr: &SmolStr) -> Option<Literal> {
+// Scope attributes (__scope_principal / __scope_resource) are indexed under two
+// different literal encodings depending on how the policy constrains them:
+// `principal == X` / `resource == X` register the exact EntityUID, while
+// `principal is T` / `resource is T` register the type name as a String (see
+// `principal_or_resource_scope_constraints`). Return both candidate literals here
+// so lookups match whichever encoding a given policy used to register its edge.
+fn request_scope_literals(request: &Request, attr: &SmolStr) -> Vec<Literal> {
     match attr.as_str() {
         SCOPE_PRINCIPAL_ATTR => request
             .principal()
             .uid()
-            .map(|uid| Literal::EntityUID(Arc::new(uid.clone()))),
+            .map(|uid| {
+                vec![
+                    Literal::EntityUID(Arc::new(uid.clone())),
+                    Literal::String(uid.entity_type().to_smolstr()),
+                ]
+            })
+            .unwrap_or_default(),
         SCOPE_RESOURCE_ATTR => request
             .resource()
             .uid()
-            .map(|uid| Literal::EntityUID(Arc::new(uid.clone()))),
+            .map(|uid| {
+                vec![
+                    Literal::EntityUID(Arc::new(uid.clone())),
+                    Literal::String(uid.entity_type().to_smolstr()),
+                ]
+            })
+            .unwrap_or_default(),
         SCOPE_ACTION_ATTR => request
             .action()
             .uid()
-            .map(|uid| Literal::EntityUID(Arc::new(uid.clone()))),
-        _ => None,
+            .map(|uid| vec![Literal::EntityUID(Arc::new(uid.clone()))])
+            .unwrap_or_default(),
+        _ => vec![],
     }
 }
 
 fn request_values_for_attr(request: &Request, entities: &Entities, attr: &SmolStr) -> Vec<Literal> {
-    if let Some(scope_literal) = request_scope_literal(request, attr) {
-        return vec![scope_literal];
+    let scope_literals = request_scope_literals(request, attr);
+    if !scope_literals.is_empty() {
+        return scope_literals;
     }
 
-    let mut values: HashSet<Literal> = HashSet::new();
-
-    for entry in [request.resource(), request.principal()] {
-        let Some(uid) = entry.uid() else {
-            continue;
-        };
-        if let Dereference::Data(entity) = entities.entity(uid) {
-            if let Some(PartialValue::Value(v)) = entity.get(attr.as_str()) {
-                if let Some(lit) = v.try_as_lit() {
-                    values.insert(lit.clone());
-                }
-            }
-        }
+    // Every non-scope constraint this tree can act on was registered under a
+    // side-scoped key (see `side_scoped_attr`), so only look up the ONE
+    // entity the key actually refers to -- never both. A key that isn't
+    // side-scoped never has a matching pv_map entry (see `build_from_entities`)
+    // and so is never chosen as a split attribute; this path only exists as a
+    // safe default if that invariant is ever violated.
+    let Some((is_principal, raw_attr)) = split_side_scoped_attr(attr.as_str()) else {
+        return Vec::new();
+    };
+    let entry = if is_principal {
+        request.principal()
+    } else {
+        request.resource()
+    };
+    let Some(uid) = entry.uid() else {
+        return Vec::new();
+    };
+    let Dereference::Data(entity) = entities.entity(uid) else {
+        return Vec::new();
+    };
+    match entity.get(raw_attr) {
+        Some(PartialValue::Value(v)) => v.try_as_lit().map(|lit| vec![lit.clone()]).unwrap_or_default(),
+        _ => Vec::new(),
     }
-
-    values.into_iter().collect()
 }
 
+// Each of these three constraint-extraction functions returns, alongside the
+// extracted `Constraint`s, a `bool` indicating whether the constraint form was
+// FULLY captured. `false` means the policy imposes a real restriction on this
+// dimension that we could not represent (e.g. `in` hierarchy membership, a
+// template slot, or -- for `collect_attr_constraints` -- anything other than a
+// flat `entity.attr == <literal>` equality: cross-attribute comparisons,
+// `!=`, `has`, `like`, `or`, `unless`, etc).
+//
+// This distinction matters: "no constraint extracted" must not be conflated
+// with "policy is unconstrained on this attribute". A policy that returns
+// `false` anywhere must NEVER be represented in the tree (see
+// `PolTreeIndex::build_from_policy_set`), because the tree's wildcard-fallback
+// path treats "absent from every pv_map entry" as "matches unconditionally" --
+// which is only sound for constraints we actually understood.
 fn principal_or_resource_scope_constraints(
     entities: &Entities,
     attr_name: &str,
     constraint: &PrincipalOrResourceConstraint,
-) -> Vec<Constraint> {
+) -> (Vec<Constraint>, bool) {
     let attr = SmolStr::from(attr_name);
     match constraint {
-        PrincipalOrResourceConstraint::Any => vec![],
-        PrincipalOrResourceConstraint::Eq(EntityReference::EUID(uid)) => vec![Constraint {
-            attr,
-            values: vec![Literal::EntityUID(uid.clone())],
-            candidates: entities_with_uid(entities, uid),
-        }],
-        PrincipalOrResourceConstraint::Is(entity_type) => vec![Constraint {
-            attr,
-            values: vec![Literal::String(entity_type.to_smolstr())],
-            candidates: entities_with_type(entities, entity_type),
-        }],
+        PrincipalOrResourceConstraint::Any => (vec![], true),
+        PrincipalOrResourceConstraint::Eq(EntityReference::EUID(uid)) => (
+            vec![Constraint {
+                attr,
+                values: vec![Literal::EntityUID(uid.clone())],
+                candidates: entities_with_uid(entities, uid),
+            }],
+            true,
+        ),
+        PrincipalOrResourceConstraint::Is(entity_type) => (
+            vec![Constraint {
+                attr,
+                values: vec![Literal::String(entity_type.to_smolstr())],
+                candidates: entities_with_type(entities, entity_type),
+            }],
+            true,
+        ),
         PrincipalOrResourceConstraint::In(EntityReference::EUID(_))
-        | PrincipalOrResourceConstraint::IsIn(_, EntityReference::EUID(_)) => vec![],
+        | PrincipalOrResourceConstraint::IsIn(_, EntityReference::EUID(_)) => (vec![], false),
         PrincipalOrResourceConstraint::Eq(EntityReference::Slot(_))
         | PrincipalOrResourceConstraint::In(EntityReference::Slot(_))
-        | PrincipalOrResourceConstraint::IsIn(_, EntityReference::Slot(_)) => vec![],
+        | PrincipalOrResourceConstraint::IsIn(_, EntityReference::Slot(_)) => (vec![], false),
     }
 }
 
-fn action_scope_constraints(entities: &Entities, constraint: &ActionConstraint) -> Vec<Constraint> {
+fn action_scope_constraints(
+    entities: &Entities,
+    constraint: &ActionConstraint,
+) -> (Vec<Constraint>, bool) {
     let attr = SmolStr::from(SCOPE_ACTION_ATTR);
     match constraint {
-        ActionConstraint::Any => vec![],
-        ActionConstraint::Eq(uid) => vec![Constraint {
-            attr,
-            values: vec![Literal::EntityUID(uid.clone())],
-            candidates: entities_with_uid(entities, uid),
-        }],
-        ActionConstraint::In(_) => vec![],
+        ActionConstraint::Any => (vec![], true),
+        ActionConstraint::Eq(uid) => (
+            vec![Constraint {
+                attr,
+                values: vec![Literal::EntityUID(uid.clone())],
+                candidates: entities_with_uid(entities, uid),
+            }],
+            true,
+        ),
+        ActionConstraint::In(_) => (vec![], false),
         #[cfg(feature = "tolerant-ast")]
-        ActionConstraint::ErrorConstraint => vec![],
+        ActionConstraint::ErrorConstraint => (vec![], false),
     }
 }
 
-// Expr-tree walker: extract (attr, Literal) equality constraints from the non-scope condition of a policy
-fn collect_attr_constraints(expr: &Expr, constraints: &mut Vec<(SmolStr, Literal)>) {
+// Expr-tree walker: extract (attr, Literal) equality constraints from the non-scope
+// condition of a policy. Returns whether `expr` was FULLY decomposed into such
+// constraints with nothing left over -- see the module comment above.
+fn collect_attr_constraints(expr: &Expr, constraints: &mut Vec<(SmolStr, Literal)>) -> bool {
+    // Which side (principal/resource) `base` is, if it's one of those two vars.
+    fn side_of(base: &Expr) -> Option<bool> {
+        match base.expr_kind() {
+            ExprKind::Var(Var::Principal) => Some(true),
+            ExprKind::Var(Var::Resource) => Some(false),
+            _ => None,
+        }
+    }
+
     match expr.expr_kind() {
         ExprKind::And { left, right } => {
-            collect_attr_constraints(left, constraints);
-            collect_attr_constraints(right, constraints);
+            let l = collect_attr_constraints(left, constraints);
+            let r = collect_attr_constraints(right, constraints);
+            l && r
         }
         ExprKind::BinaryApp {
             op: BinaryOp::Eq,
@@ -166,26 +270,96 @@ fn collect_attr_constraints(expr: &Expr, constraints: &mut Vec<(SmolStr, Literal
                 (
                     ExprKind::GetAttr { expr: base, attr }, // rename to base to avoid conflict with function argument
                     ExprKind::Lit(lit),
-                ) if matches!(
-                    base.expr_kind(),
-                    ExprKind::Var(Var::Resource) | ExprKind::Var(Var::Principal)
-                ) =>
-                {
-                    constraints.push((attr.clone(), lit.clone()));
+                ) => match side_of(base) {
+                    Some(is_principal) => {
+                        constraints.push((side_scoped_attr(is_principal, attr), lit.clone()));
+                        true
+                    }
+                    None => false,
+                },
+                (ExprKind::Lit(lit), ExprKind::GetAttr { expr: base, attr }) => {
+                    match side_of(base) {
+                        Some(is_principal) => {
+                            constraints.push((side_scoped_attr(is_principal, attr), lit.clone()));
+                            true
+                        }
+                        None => false,
+                    }
                 }
-                (ExprKind::Lit(lit), ExprKind::GetAttr { expr: base, attr })
-                    if matches!(
-                        base.expr_kind(),
-                        ExprKind::Var(Var::Resource) | ExprKind::Var(Var::Principal)
-                    ) =>
-                {
-                    constraints.push((attr.clone(), lit.clone()));
-                }
-                _ => {}
+                _ => false,
             }
         }
-        _ => {}
+        _ => false,
     }
+}
+
+/// Determine, for a single policy, whether every scope and non-scope constraint
+/// could be soundly captured as flat equality constraints -- see the notes
+/// above `principal_or_resource_scope_constraints` and `collect_attr_constraints`.
+/// `forbid`-effect policies always report `false`: this tree has no notion of
+/// forbid overriding permit, so a forbid can never be safely represented by it.
+///
+/// This is cheaper than `PolTreeIndex::build_from_policy_set` since it discards
+/// the extracted constraints -- useful when only the indexed/residual split is
+/// needed without paying for a full index/tree rebuild (e.g. when restoring a
+/// previously-serialized `PolTree` from disk, which does not persist this split).
+pub fn policy_is_fully_indexed(policy: &Policy, entities: &Entities) -> bool {
+    if policy.effect() == Effect::Forbid {
+        return false;
+    }
+    let (_, ok1) = principal_or_resource_scope_constraints(
+        entities,
+        SCOPE_PRINCIPAL_ATTR,
+        policy.template().principal_constraint().as_inner(),
+    );
+    let (_, ok2) = principal_or_resource_scope_constraints(
+        entities,
+        SCOPE_RESOURCE_ATTR,
+        policy.template().resource_constraint().as_inner(),
+    );
+    let (_, ok3) = action_scope_constraints(entities, policy.template().action_constraint());
+    let ok4 = match policy.template().non_scope_constraints() {
+        Some(expr) => collect_attr_constraints(expr, &mut Vec::new()),
+        None => true,
+    };
+    ok1 && ok2 && ok3 && ok4
+}
+
+/// The IDs of every policy in `policy_set` that is NOT fully indexable (see
+/// [`policy_is_fully_indexed`]) -- i.e. every policy that a [`PolTree`] must
+/// exclude and that callers must instead evaluate with a real Cedar evaluator.
+pub fn residual_policy_ids(policy_set: &PolicySet, entities: &Entities) -> Vec<PolicyID> {
+    policy_set
+        .policies()
+        .filter(|p| !policy_is_fully_indexed(p, entities))
+        .map(|p| p.id().clone())
+        .collect()
+}
+
+/// Build a `PolicySet` containing exactly the policies in `policy_set` whose
+/// IDs appear in `residual_ids` -- for real (non-indexed) evaluation of the
+/// policies a [`PolTree`] had to exclude.
+pub fn build_residual_policy_set_from_ids(
+    policy_set: &PolicySet,
+    residual_ids: &[PolicyID],
+) -> PolicySet {
+    let residual_ids: HashSet<&PolicyID> = residual_ids.iter().collect();
+    let mut out = PolicySet::new();
+    for policy in policy_set.policies() {
+        if residual_ids.contains(policy.id()) {
+            // `policy_set` is known-valid and we are only re-inserting
+            // policies it already contains, so this cannot fail.
+            let _ = out.add(policy.clone());
+        }
+    }
+    out
+}
+
+/// Convenience combining [`residual_policy_ids`] and
+/// [`build_residual_policy_set_from_ids`] for callers that don't already have
+/// the residual ID list on hand (e.g. after restoring a serialized [`PolTree`]).
+pub fn build_residual_policy_set(policy_set: &PolicySet, entities: &Entities) -> PolicySet {
+    build_residual_policy_set_from_ids(policy_set, &residual_policy_ids(policy_set, entities))
 }
 
 /// struct representing the entire PolTree
@@ -328,14 +502,31 @@ impl PolTree {
     }
 
     /// Convenience constructor which derives all required PolTree inputs from a [`PolicySet`] and an [`Entities`] store.
-    pub fn from_policy_set_and_entities(policy_set: &PolicySet, entities: Arc<Entities>) -> Self {
-        let index = PolTreeIndex::build_from_policy_set(policy_set, entities);
-        let policy_ids: Vec<PolicyID> = policy_set.policies().map(|p| p.id().clone()).collect();
+    ///
+    /// Returns the built tree together with the IDs of any policies that could
+    /// not be soundly represented in it (see [`PolTreeIndex::build_from_policy_set`]).
+    /// Those policies are entirely excluded from the tree -- not indexed, not on
+    /// any wildcard branch -- and must be evaluated by a real Cedar evaluator by
+    /// the caller and combined with this tree's result.
+    pub fn from_policy_set_and_entities(
+        policy_set: &PolicySet,
+        entities: Arc<Entities>,
+    ) -> (Self, Vec<PolicyID>) {
+        let (index, residual) = PolTreeIndex::build_from_policy_set(policy_set, entities);
+        let residual_set: HashSet<&PolicyID> = residual.iter().collect();
+        let policy_ids: Vec<PolicyID> = policy_set
+            .policies()
+            .map(|p| p.id().clone())
+            .filter(|id| !residual_set.contains(id))
+            .collect();
         let mut attrs: Vec<SmolStr> = index.attr_values.keys().cloned().collect();
         attrs.sort();
         attrs.dedup();
         let entities: Vec<EntityUID> = index.entities.iter().map(|e| e.uid().clone()).collect();
-        Self::build_n_poltree(policy_ids, attrs, entities, &index)
+        (
+            Self::build_n_poltree(policy_ids, attrs, entities, &index),
+            residual,
+        )
     }
 
     /// Evaluate one access request against this N-PolTree.
@@ -447,47 +638,89 @@ impl PolTreeIndex {
     /// Only flat equality constraints of the form
     /// `resource.attr == <literal>` (or `principal.attr == <literal>`) are
     /// recognised; more complex conditions are ignored (safe under-approximation).
-    pub fn build_from_policy_set(policy_set: &PolicySet, entities: Arc<Entities>) -> Self {
+    ///
+    /// Policies whose scope or non-scope condition could not be FULLY captured
+    /// as flat equality constraints -- and any `forbid`-effect policy, since
+    /// this tree has no notion of forbid overriding permit -- are excluded from
+    /// the returned index entirely and reported as the second return value.
+    /// They must be evaluated by a real Cedar evaluator and combined with this
+    /// tree's result by the caller; the index must never place them on a
+    /// wildcard fallback branch, since "we don't know this policy's condition"
+    /// is not the same as "this policy has no condition".
+    pub fn build_from_policy_set(
+        policy_set: &PolicySet,
+        entities: Arc<Entities>,
+    ) -> (Self, Vec<PolicyID>) {
         let mut pv_map: HashMap<(SmolStr, Literal), Vec<PolicyID>> = HashMap::new();
         let mut policy_entities_map: HashMap<PolicyID, Vec<EntityUID>> = HashMap::new();
+        let mut residual: Vec<PolicyID> = Vec::new();
 
         for policy in policy_set.policies() {
             let pid = policy.id().clone();
-            let mut constraints: Vec<Constraint> = Vec::new();
 
-            constraints.extend(principal_or_resource_scope_constraints(
+            if policy.effect() == Effect::Forbid {
+                residual.push(pid);
+                continue;
+            }
+
+            let mut constraints: Vec<Constraint> = Vec::new();
+            let mut fully_indexed = true;
+
+            let (c, ok) = principal_or_resource_scope_constraints(
                 entities.as_ref(),
                 SCOPE_PRINCIPAL_ATTR,
                 policy.template().principal_constraint().as_inner(),
-            ));
-            constraints.extend(principal_or_resource_scope_constraints(
+            );
+            constraints.extend(c);
+            fully_indexed &= ok;
+
+            let (c, ok) = principal_or_resource_scope_constraints(
                 entities.as_ref(),
                 SCOPE_RESOURCE_ATTR,
                 policy.template().resource_constraint().as_inner(),
-            ));
-            constraints.extend(action_scope_constraints(
+            );
+            constraints.extend(c);
+            fully_indexed &= ok;
+
+            let (c, ok) = action_scope_constraints(
                 entities.as_ref(),
                 policy.template().action_constraint(),
-            ));
+            );
+            constraints.extend(c);
+            fully_indexed &= ok;
 
             let mut non_scope_constraints: Vec<(SmolStr, Literal)> = Vec::new();
 
             // Walk the non-scope (when/unless) condition expression
             if let Some(expr) = policy.template().non_scope_constraints() {
-                collect_attr_constraints(expr, &mut non_scope_constraints);
+                fully_indexed &= collect_attr_constraints(expr, &mut non_scope_constraints);
             }
 
-            constraints.extend(
-                non_scope_constraints
-                    .into_iter()
-                    .map(|(attr, lit)| Constraint {
-                        candidates: entities_with_attr_literal(entities.as_ref(), &attr, &lit),
-                        attr,
-                        values: vec![lit],
-                    }),
-            );
+            if !fully_indexed {
+                residual.push(pid);
+                continue;
+            }
+
+            constraints.extend(non_scope_constraints.into_iter().map(|(attr, lit)| {
+                // `attr` is the side-scoped index key (see `side_scoped_attr`);
+                // `entities_with_attr_literal` needs the underlying entity
+                // attribute name to actually find matching entities.
+                let raw_attr = split_side_scoped_attr(attr.as_str())
+                    .map(|(_, raw)| SmolStr::from(raw))
+                    .unwrap_or_else(|| attr.clone());
+                Constraint {
+                    candidates: entities_with_attr_literal(entities.as_ref(), &raw_attr, &lit),
+                    attr,
+                    values: vec![lit],
+                }
+            }));
 
             if constraints.is_empty() {
+                // Genuinely unconditional policy (e.g. `permit(principal, action, resource);`).
+                // Correctly represented by the tree's natural wildcard fallback: it is
+                // present in every node's `policy_ids` but has no pv_map entry, so it is
+                // found only once every more specific branch has been tried -- which is
+                // exactly right, since it really does match everything.
                 continue;
             }
 
@@ -519,7 +752,10 @@ impl PolTreeIndex {
             }
         }
 
-        Self::build_from_entities(entities, pv_map, policy_entities_map)
+        (
+            Self::build_from_entities(entities, pv_map, policy_entities_map),
+            residual,
+        )
     }
 
     /// Build a `PolTreeIndex` from an `Entities` store and caller-provided policy maps
