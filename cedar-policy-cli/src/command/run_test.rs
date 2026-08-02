@@ -15,7 +15,7 @@
  */
 
 use clap::Args;
-use miette::{miette, IntoDiagnostic, Report, Result, WrapErr};
+use miette::{IntoDiagnostic, Report, Result, WrapErr};
 use owo_colors::OwoColorize;
 use serde::de::{DeserializeSeed, IntoDeserializer};
 use serde::{Deserialize, Deserializer};
@@ -273,12 +273,13 @@ impl<'de, 'a> DeserializeSeed<'de> for CheckedTestCaseSeed<'a> {
             serde::de::Error::custom(format!("failed to parse resource `{resource}`: {e}",))
         })?;
 
-        let context = Context::from_json_value(request.context.clone(), None).map_err(|e| {
-            serde::de::Error::custom(format!(
-                "failed to parse context `{}`: {}",
-                request.context, e
-            ))
-        })?;
+        let context = Context::from_json_value(request.context.clone(), self.0.zip(Some(&action)))
+            .map_err(|e| {
+                serde::de::Error::custom(format!(
+                    "failed to parse context `{}`: {}",
+                    request.context, e
+                ))
+            })?;
 
         let request = Request::new(principal, action, resource, context, self.0)
             .map_err(|e| serde::de::Error::custom(format!("failed to create request: {e}")))?;
@@ -299,24 +300,143 @@ impl<'de, 'a> DeserializeSeed<'de> for CheckedTestCaseSeed<'a> {
 /// Load partially parsed tests from a JSON file
 /// (as JSON values first without parsing to TestCase)
 fn load_partial_tests(tests_filename: impl AsRef<Path>) -> Result<Vec<serde_json::Value>> {
-    match std::fs::OpenOptions::new()
+    let f = std::fs::OpenOptions::new()
         .read(true)
         .open(tests_filename.as_ref())
-    {
-        Ok(f) => {
-            let reader = BufReader::new(f);
-            serde_json::from_reader(reader).map_err(|e| {
-                miette!(
-                    "failed to parse tests from file {}: {e}",
-                    tests_filename.as_ref().display()
-                )
-            })
-        }
-        Err(e) => Err(e).into_diagnostic().wrap_err_with(|| {
+        .into_diagnostic()
+        .wrap_err_with(|| {
             format!(
                 "failed to open test file {}",
                 tests_filename.as_ref().display()
             )
-        }),
+        })?;
+    let reader = BufReader::new(f);
+    serde_json::from_reader(reader)
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "failed to parse tests from file {}",
+                tests_filename.as_ref().display()
+            )
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::test_utils::render_err;
+
+    fn schema() -> Schema {
+        Schema::from_cedarschema_str(
+            "entity User; entity Photo; action view appliesTo { principal: [User], resource: [Photo] };",
+        )
+        .expect("test schema should parse")
+        .0
+    }
+
+    fn deserialize(
+        schema: Option<&Schema>,
+        request: serde_json::Value,
+    ) -> Result<TestCase, String> {
+        let test = serde_json::json!({
+            "request": request,
+            "entities": [],
+            "decision": "deny",
+            "reason": [],
+            "num_errors": 0,
+        });
+        CheckedTestCaseSeed(schema)
+            .deserialize(test.into_deserializer())
+            .into_diagnostic()
+            .map_err(|e| render_err(&e))
+    }
+
+    #[test]
+    fn bad_principal() {
+        let request = serde_json::json!({
+            "principal": "not an euid",
+            "action": "Action::\"view\"",
+            "resource": "Photo::\"pic\"",
+            "context": {},
+        });
+        insta::assert_snapshot!(
+            deserialize(None, request).unwrap_err(),
+            @"  × failed to parse principal `not an euid`: unexpected token `an`"
+        );
+    }
+
+    #[test]
+    fn bad_action() {
+        let request = serde_json::json!({
+            "principal": "User::\"alice\"",
+            "action": "not an euid",
+            "resource": "Photo::\"pic\"",
+            "context": {},
+        });
+        insta::assert_snapshot!(
+            deserialize(None, request).unwrap_err(),
+            @"  × failed to parse action `not an euid`: unexpected token `an`"
+        );
+    }
+
+    #[test]
+    fn bad_resource() {
+        let request = serde_json::json!({
+            "principal": "User::\"alice\"",
+            "action": "Action::\"view\"",
+            "resource": "not an euid",
+            "context": {},
+        });
+        insta::assert_snapshot!(
+            deserialize(None, request).unwrap_err(),
+            @"  × failed to parse resource `not an euid`: unexpected token `an`"
+        );
+    }
+
+    #[test]
+    fn action_not_in_schema() {
+        let request = serde_json::json!({
+            "principal": "User::\"alice\"",
+            "action": "Action::\"delete\"",
+            "resource": "Photo::\"pic\"",
+            "context": {},
+        });
+
+        insta::assert_snapshot!(
+            deserialize(Some(&schema()), request).unwrap_err(),
+            @r#"  × failed to parse context `{}`: action `Action::"delete"` does not exist in the supplied schema"#
+        );
+    }
+
+    #[test]
+    fn principal_invalid_for_action() {
+        let request = serde_json::json!({
+            "principal": "Photo::\"pic\"",
+            "action": "Action::\"view\"",
+            "resource": "Photo::\"pic\"",
+            "context": {},
+        });
+
+        insta::assert_snapshot!(
+            deserialize(Some(&schema()), request).unwrap_err(),
+            @r#"  × failed to create request: principal type `Photo` is not valid for `Action::"view"`"#
+        );
+    }
+
+    #[test]
+    fn bad_context() {
+        // `view` takes no context, so this context is invalid under the schema.
+        let request = serde_json::json!({
+            "principal": "User::\"alice\"",
+            "action": "Action::\"view\"",
+            "resource": "Photo::\"pic\"",
+            "context": { "unexpected": true },
+        });
+
+        // With a schema present the bad context is rejected.
+        insta::assert_snapshot!(
+            deserialize(Some(&schema()), request).unwrap_err(),
+            @"  × failed to parse context `{\"unexpected\":true}`: while parsing context, record attribute `unexpected` should not exist according to the schema"
+        );
     }
 }

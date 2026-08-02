@@ -6,11 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
 Cedar Language Version: TBD
+
+## [0.6.0] - 2026-07-28
+
+Cedar Language Version: 4.5
+
+### Added
+
+- `CompiledSchema` type that precomputes symbolic entities once per schema and produces
+  `SymEnv` instances via `sym_env()`, avoiding expensive per-environment rebuilds.
 
 ### Fixed
 
-- Model decoder now accepts hexadecimal bitvectors in solver output, improving compatibility with Z3 and other solvers that include literals like `#xff` in their `(get-model)` responses.
+- Fix errors decoding models from Z3. The model decoder now accepts hexadecimal bitvectors
+  in solver output (e.g., `#xff`). It also handles an option literal `none`
+  without an explicit type annotation, as long as it can infer the type. Finally, it accepts
+  models for UUFs with equality operands in either order.
+- Fix errors decoding models for entities with `Bool` typed tags.
+
+## [0.5.3] - 2026-06-09
+Cedar Language Version: 4.5
 
 ## [0.5.2] - 2026-06-09
 Cedar Language Version: 4.5

@@ -524,7 +524,7 @@ fn test_never_errors_rejects_empty_policy() {
         .assert()
         .failure()
         .stderr(predicates::str::contains(
-            "Expected exactly one policy, found 0",
+            "Expected exactly one policy in --policies, found 0",
         ));
 }
 
@@ -1033,6 +1033,42 @@ fn test_no_template_warning_without_templates() {
 }
 
 #[test]
+fn test_error_if_contains_templates_single_policy() {
+    let schema = write_temp(SAMPLE_SCHEMA);
+    let policy = write_temp(
+        r#"
+        permit(principal, action, resource);
+        forbid(principal == ?principal, action, resource);
+        "#,
+    );
+
+    let output = cargo::cargo_bin_cmd!("cedar")
+        .arg("symcc")
+        .arg("--principal-type")
+        .arg("Identity")
+        .arg("--action")
+        .arg(r#"Action::"view""#)
+        .arg("--resource-type")
+        .arg("Thing")
+        .arg("--schema")
+        .arg(schema.path())
+        .arg("--schema-format")
+        .arg("cedar")
+        .arg("always-matches")
+        .arg("--policies")
+        .arg(policy.path())
+        .output()
+        .expect("failed to run cedar");
+
+    assert!(!output.status.success(), "expected non-zero exit code");
+    insta::assert_snapshot!(String::from_utf8_lossy(&output.stderr), @"
+    × Analysis failed
+    ╰─▶ Expected exactly one static policy in --policies, found 1 policy
+        template(s)
+    ");
+}
+
+#[test]
 fn test_warn_if_contains_templates_two_policy_sets() {
     let schema = write_temp(SAMPLE_SCHEMA);
     // First policy set has a template
@@ -1097,4 +1133,45 @@ fn test_equivalent_does_not_hold_no_counterexample() {
         .success()
         .stdout(predicates::str::contains("DOES NOT HOLD"))
         .stdout(predicates::str::contains("Counterexample found").not());
+}
+
+#[test]
+fn validation_error_pretty_print() {
+    let schema = write_temp(SAMPLE_SCHEMA);
+    let policy = write_temp("permit(principal, action, resource) when { resource.nonexistent };");
+
+    let output = cargo::cargo_bin_cmd!("cedar")
+        .env("NO_COLOR", "1")
+        .arg("symcc")
+        .arg("--principal-type")
+        .arg("Identity")
+        .arg("--action")
+        .arg(r#"Action::"view""#)
+        .arg("--resource-type")
+        .arg("Thing")
+        .arg("--schema")
+        .arg(schema.path())
+        .arg("--schema-format")
+        .arg("cedar")
+        .arg("never-errors")
+        .arg("--policies")
+        .arg(policy.path())
+        .output()
+        .expect("failed to run cedar");
+
+    assert!(!output.status.success(), "expected non-zero exit code");
+    insta::assert_snapshot!(String::from_utf8_lossy(&output.stderr), @"
+      × Analysis failed
+      ├─▶ Failed to compile policy
+      ╰─▶ input policy (set) is not well typed with respect to the schema
+
+    Error: 
+      × for policy `policy0`, attribute `nonexistent` on entity type `Thing` not
+      │ found
+       ╭────
+     1 │ permit(principal, action, resource) when { resource.nonexistent };
+       ·                                            ────────────────────
+       ╰────
+      help: did you mean `description`?
+    ");
 }

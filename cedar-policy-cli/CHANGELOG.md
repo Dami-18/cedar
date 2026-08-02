@@ -5,6 +5,8 @@ Changes to the Cedar language, which are likely to affect users of the CLI, are 
 
 ## Unreleased
 
+## 4.12.0
+
 ### Added
 
 - `cedar license` subcommand printing the project license and bundled third-party attributions.
@@ -14,6 +16,15 @@ Changes to the Cedar language, which are likely to affect users of the CLI, are 
 ### Changed
 
 - The `authorize` command with the `--template-linked` argument will now error if the link file does not exist.
+- For the experimental `tpe` and `partial-eval` features, an unknown authorization decision now causes the CLI to exit with exit code 4 instead of 0, making it distinguishable from a successful authorization allow decision (exit code 0).
+
+### Fixed
+
+- `symcc` single-policy and two-policy commands now error if the `--policies` file contains templates. Previously templates were silently ignored.
+   Policy-set commands continue to accept and ignore templates with a warning.
+- `run-tests` command now uses provided schema when parsing the context for tests cases.
+
+## 4.11.2
 
 ## 4.11.1
 
@@ -137,6 +148,8 @@ checked against the schema, tests fail should schema validation fail.
 - CLI arguments `--policy-format` and `--schema-format` now take options
   `cedar` or `json`, as opposed to `human` or `json`. Similarly, `--direction`
   takes `cedar-to-json` or `json-to-cedar`. (#1114)
+
+## 3.4.3
 
 ## 3.4.2
 

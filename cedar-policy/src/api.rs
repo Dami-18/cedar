@@ -2784,9 +2784,8 @@ impl AsRef<ast::PolicySet> for PolicySet {
 }
 
 #[doc(hidden)]
-impl TryFrom<ast::PolicySet> for PolicySet {
-    type Error = PolicySetError;
-    fn try_from(pset: ast::PolicySet) -> Result<Self, Self::Error> {
+impl From<ast::PolicySet> for PolicySet {
+    fn from(pset: ast::PolicySet) -> Self {
         Self::from_ast(pset)
     }
 }
@@ -2883,7 +2882,7 @@ impl PolicySet {
     }
 
     /// Build the [`PolicySet`] from just the AST information
-    pub(crate) fn from_ast(ast: ast::PolicySet) -> Result<Self, PolicySetError> {
+    pub(crate) fn from_ast(ast: ast::PolicySet) -> Self {
         let templates = ast
             .templates()
             .cloned()
@@ -2894,11 +2893,11 @@ impl PolicySet {
             .cloned()
             .map(|p| (PolicyId::new(p.id().clone()), p.into()))
             .collect();
-        Ok(Self {
+        Self {
             ast,
             policies,
             templates,
-        })
+        }
     }
 
     /// Construct a [`PolicySet`] from a PST [`pst::PolicySet`].
@@ -2910,6 +2909,13 @@ impl PolicySet {
     pub fn from_pst(pst_set: pst::PolicySet) -> Result<Self, PolicySetError> {
         let mut set = Self::new();
         for (id, template) in pst_set.templates {
+            if id != template.id {
+                return Err(policy_set_errors::InconsistentPolicyId {
+                    map_key: id.into(),
+                    inner_id: template.id.into(),
+                }
+                .into());
+            }
             let ast_template: ast::Template = template.clone().try_into()?;
             set.ast.add_template(ast_template.clone())?;
             set.templates.insert(
@@ -2921,6 +2927,13 @@ impl PolicySet {
             );
         }
         for (id, static_policy) in pst_set.policies {
+            if &id != static_policy.id() {
+                return Err(policy_set_errors::InconsistentPolicyId {
+                    map_key: id.into(),
+                    inner_id: static_policy.id().clone().into(),
+                }
+                .into());
+            }
             let pst_policy = pst::Policy::Static(static_policy);
             let ast_policy: ast::Policy = pst_policy.clone().try_into()?;
             set.ast.add(ast_policy.clone())?;
@@ -3688,7 +3701,6 @@ fn get_valid_request_envs(ast: &ast::Template, s: &Schema) -> impl Iterator<Item
         cedar_policy_core::validator::ValidationMode::default(),
     );
     tc.typecheck_by_request_env(ast)
-        .into_iter()
         .filter_map(|(env, pc)| {
             if matches!(pc, PolicyCheck::Success(_)) {
                 Some(env.into())

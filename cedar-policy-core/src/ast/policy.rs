@@ -22,7 +22,6 @@ use crate::parser::{
 use annotation::{Annotation, Annotations};
 use educe::Educe;
 use itertools::Itertools;
-use linked_hash_map::LinkedHashMap;
 use miette::Diagnostic;
 use nonempty::{nonempty, NonEmpty};
 use serde::{Deserialize, Serialize};
@@ -99,18 +98,31 @@ impl From<Template> for TemplateBody {
 }
 
 impl Template {
+    /// Verify that the slot cache matches the actual slots in the condition.
+    ///
+    /// Returns `Ok(())` if the cache is correct, or
+    /// `Err(TemplateValidationError::SlotCacheMismatch)` if not.
+    fn check_slot_cache(&self) -> Result<(), TemplateValidationError> {
+        for slot in self.body.condition().slots() {
+            if !self.slots.contains(&slot) {
+                return Err(TemplateValidationError::SlotCacheMismatch);
+            }
+        }
+        for slot in &self.slots {
+            if !self.body.condition().slots().contains(slot) {
+                return Err(TemplateValidationError::SlotCacheMismatch);
+            }
+        }
+        Ok(())
+    }
+
     /// Checks the invariant (slot cache correctness)
     ///
     /// This function is a no-op in release builds, but checks the invariant (and panics if it fails) in debug builds.
     pub fn check_invariant(&self) {
         #[cfg(debug_assertions)]
         {
-            for slot in self.body.condition().slots() {
-                assert!(self.slots.contains(&slot));
-            }
-            for slot in self.slots() {
-                assert!(self.body.condition().slots().contains(slot));
-            }
+            assert!(self.check_slot_cache().is_ok());
         }
     }
 
@@ -332,6 +344,14 @@ impl Template {
             .map(|_| Policy::new(template, Some(new_id), values))
     }
 
+    /// Create a static policy from a template that has no slots.
+    /// This will fail if the template has any open slots.
+    pub fn try_as_policy(template: Arc<Template>) -> Result<Policy, LinkingError> {
+        // INVARIANT (policy total map) Relies on check_binding to uphold the invariant
+        Template::check_binding(&template, &HashMap::new())
+            .map(|_| Policy::new(template, None, HashMap::new()))
+    }
+
     /// Take a static policy and create a template and a template-linked policy for it.
     /// They will share the same ID
     pub fn link_static_policy(p: StaticPolicy) -> (Arc<Template>, Policy) {
@@ -349,15 +369,14 @@ impl Template {
     }
 
     /// Checks that this template is well-formed according to internal invariants of [`Template`],
-    /// and if not, returns an error.
+    /// and if not, returns an error.  [`try_validate`] checks that this is a 'syntactically valid'
+    /// template that could have been constructed by parsing.
     ///
     /// This will check the following invariants:
-    /// - slots do not appear in conditions
-    /// - action constraints only references Action entity types
-    /// - the slot cache is correct
-    ///
-    /// This function is meant to cover gaps between parsed templates and other ways to construct
-    /// templates. This is *not* doing any semantic validation beyond the checks mentioned.
+    /// - slots do not appear in conditions,
+    /// - action constraints only references Action entity types,
+    /// - the slot cache is correct,
+    /// - the condition is a valid expression according to [`Expr::try_validate`].
     pub fn try_validate(self) -> Result<Self, TemplateValidationError> {
         // Invariant: slots must not appear in non-scope constraints (when/unless clauses)
         if let Some(expr) = self.body.non_scope_constraints() {
@@ -371,36 +390,17 @@ impl Template {
             }
         }
         // Invariant: action constraint must only reference Action entity types
-        match self.body.action_constraint() {
-            ActionConstraint::Eq(euid) => {
-                if !euid.is_action() {
-                    return Err(TemplateValidationError::InvalidActionType(
-                        InvalidActionType {
-                            euids: nonempty![euid.clone()],
-                        },
-                    ));
-                }
-            }
-            ActionConstraint::In(euids) => {
-                let invalid: Vec<_> = euids.iter().filter(|e| !e.is_action()).cloned().collect();
-                if let Some(non_empty) = NonEmpty::from_vec(invalid) {
-                    return Err(TemplateValidationError::InvalidActionType(
-                        InvalidActionType { euids: non_empty },
-                    ));
-                }
-            }
-            _ => {}
+        if let Err(euids) = self.body.action_constraint().check_action_types() {
+            return Err(TemplateValidationError::InvalidActionType(
+                InvalidActionType { euids },
+            ));
         }
+
         // Invariant: slot cache correctness
-        for slot in self.body.condition().slots() {
-            if !self.slots.contains(&slot) {
-                return Err(TemplateValidationError::SlotCacheMismatch);
-            }
-        }
-        for slot in &self.slots {
-            if !self.body.condition().slots().contains(slot) {
-                return Err(TemplateValidationError::SlotCacheMismatch);
-            }
+        self.check_slot_cache()?;
+        // Invariant: expressions must be valid (e.g., known extension functions)
+        if let Some(expr) = self.body.non_scope_constraints() {
+            expr.clone().try_validate()?;
         }
         Ok(self)
     }
@@ -420,6 +420,10 @@ pub enum TemplateValidationError {
     /// Slot cache does not match the slots in the condition
     #[error("template slot cache is inconsistent with condition expression")]
     SlotCacheMismatch,
+    /// Invalid expression in conditions (e.g., unknown extension function)
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    InvalidExpression(#[from] ExprValidationError),
 }
 
 impl From<TemplateBody> for Template {
@@ -496,8 +500,8 @@ fn describe_arity_error(
 ///   - a link ID (unless it's a static policy)
 ///   - the bound values for slots in the template
 ///
-/// Policies are not serializable (due to the pointer), and can be serialized
-/// by converting to/from LiteralPolicy
+/// Policies are not directly serializable (due to the Arc pointer to the
+/// template).
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Policy {
     /// Reference to the template
@@ -716,6 +720,12 @@ impl Policy {
     }
 }
 
+fn display_slot_env(env: &SlotEnv) -> String {
+    env.iter()
+        .map(|(slot, value)| format!("{slot} -> {value}"))
+        .join(",")
+}
+
 impl std::fmt::Display for Policy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.is_static() {
@@ -733,190 +743,6 @@ impl std::fmt::Display for Policy {
 
 /// Map from Slot Ids to Entity UIDs which fill the slots
 pub type SlotEnv = HashMap<SlotId, EntityUID>;
-
-/// Represents either a static policy or a template linked policy.
-///
-/// Contains less rich information than `Policy`. In particular, this form is
-/// easier to convert to/from the Protobuf representation of a `Policy`, because
-/// it simply refers to the `Template` by its Id and does not contain a
-/// reference to the `Template` itself.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LiteralPolicy {
-    /// ID of the template this policy is an instance of
-    template_id: PolicyID,
-    /// ID of this link.
-    /// This is `None` for static policies, and the static policy ID is defined
-    /// as the `template_id`
-    link_id: Option<PolicyID>,
-    /// Values of the slots
-    values: SlotEnv,
-}
-
-impl LiteralPolicy {
-    /// Create a `LiteralPolicy` representing a static policy with the given ID.
-    ///
-    /// The policy set should also contain a (zero-slot) `Template` with the given ID.
-    pub fn static_policy(template_id: PolicyID) -> Self {
-        Self {
-            template_id,
-            link_id: None,
-            values: SlotEnv::new(),
-        }
-    }
-
-    /// Create a `LiteralPolicy` representing a template-linked policy.
-    ///
-    /// The policy set should also contain the associated `Template`.
-    pub fn template_linked_policy(
-        template_id: PolicyID,
-        link_id: PolicyID,
-        values: SlotEnv,
-    ) -> Self {
-        Self {
-            template_id,
-            link_id: Some(link_id),
-            values,
-        }
-    }
-
-    /// Get the `EntityUID` associated with the given `SlotId`, if it exists
-    pub fn value(&self, slot: &SlotId) -> Option<&EntityUID> {
-        self.values.get(slot)
-    }
-}
-
-// Can we verify the hash property?
-
-impl std::hash::Hash for LiteralPolicy {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.template_id.hash(state);
-        // this shouldn't be a performance issue as these vectors should be small
-        let mut buf = self.values.iter().collect::<Vec<_>>();
-        buf.sort();
-        for (id, euid) in buf {
-            id.hash(state);
-            euid.hash(state);
-        }
-    }
-}
-
-// These would be great as property tests
-#[cfg(test)]
-mod hashing_tests {
-    use std::{
-        collections::hash_map::DefaultHasher,
-        hash::{Hash, Hasher},
-    };
-
-    use super::*;
-
-    fn compute_hash(ir: &LiteralPolicy) -> u64 {
-        let mut s = DefaultHasher::new();
-        ir.hash(&mut s);
-        s.finish()
-    }
-
-    fn build_template_linked_policy() -> LiteralPolicy {
-        let mut map = HashMap::new();
-        map.insert(SlotId::principal(), EntityUID::with_eid("eid"));
-        LiteralPolicy {
-            template_id: PolicyID::from_string("template"),
-            link_id: Some(PolicyID::from_string("id")),
-            values: map,
-        }
-    }
-
-    #[test]
-    fn hash_property_instances() {
-        let a = build_template_linked_policy();
-        let b = build_template_linked_policy();
-        assert_eq!(a, b);
-        assert_eq!(compute_hash(&a), compute_hash(&b));
-    }
-}
-
-/// Errors that can happen during policy reification
-#[derive(Debug, Diagnostic, Error)]
-pub enum ReificationError {
-    /// The [`PolicyID`] linked to did not exist
-    #[error("the id linked to does not exist")]
-    NoSuchTemplate(PolicyID),
-    /// Error linking the policy
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    Linking(#[from] LinkingError),
-}
-
-impl LiteralPolicy {
-    /// Attempt to reify this template linked policy.
-    /// Ensures the linked template actually exists, replaces the id with a reference to the underlying template.
-    /// Fails if the template does not exist.
-    /// Consumes the policy.
-    pub fn reify(
-        self,
-        templates: &LinkedHashMap<PolicyID, Arc<Template>>,
-    ) -> Result<Policy, ReificationError> {
-        let template = templates
-            .get(&self.template_id)
-            .ok_or_else(|| ReificationError::NoSuchTemplate(self.template_id().clone()))?;
-        // INVARIANT (values total map)
-        Template::check_binding(template, &self.values).map_err(ReificationError::Linking)?;
-        Ok(Policy::new(template.clone(), self.link_id, self.values))
-    }
-
-    /// Lookup the euid bound by a SlotId
-    pub fn get(&self, id: &SlotId) -> Option<&EntityUID> {
-        self.values.get(id)
-    }
-
-    /// Get the [`PolicyID`] of this static or template-linked policy.
-    pub fn id(&self) -> &PolicyID {
-        self.link_id.as_ref().unwrap_or(&self.template_id)
-    }
-
-    /// Get the [`PolicyID`] of the template associated with this policy.
-    ///
-    /// For static policies, this is just the static policy ID.
-    pub fn template_id(&self) -> &PolicyID {
-        &self.template_id
-    }
-
-    /// Is this a static policy
-    pub fn is_static(&self) -> bool {
-        self.link_id.is_none()
-    }
-}
-
-fn display_slot_env(env: &SlotEnv) -> String {
-    env.iter()
-        .map(|(slot, value)| format!("{slot} -> {value}"))
-        .join(",")
-}
-
-impl std::fmt::Display for LiteralPolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.is_static() {
-            write!(f, "Static policy w/ ID {}", self.template_id())
-        } else {
-            write!(
-                f,
-                "Template linked policy of {}, slots: [{}]",
-                self.template_id(),
-                display_slot_env(&self.values),
-            )
-        }
-    }
-}
-
-impl From<Policy> for LiteralPolicy {
-    fn from(p: Policy) -> Self {
-        Self {
-            template_id: p.template.id().clone(),
-            link_id: p.link,
-            values: p.values,
-        }
-    }
-}
 
 /// Static Policies are policy that do not come from templates.
 /// They have the same structure as a template definition, but cannot contain slots
@@ -2008,28 +1834,38 @@ impl ActionConstraint {
 
     /// Check that all of the EUIDs in an action constraint have the type
     /// `Action`, under an arbitrary namespace.
-    pub fn contains_only_action_types(self) -> Result<Self, NonEmpty<Arc<EntityUID>>> {
+    ///
+    /// Returns the non-action EUIDs if any are found.
+    pub fn check_action_types(&self) -> Result<(), NonEmpty<Arc<EntityUID>>> {
         match self {
-            ActionConstraint::Any => Ok(self),
-            ActionConstraint::In(ref euids) => {
+            ActionConstraint::Any => Ok(()),
+            ActionConstraint::In(euids) => {
                 if let Some(euids) =
                     NonEmpty::collect(euids.iter().filter(|euid| !euid.is_action()).cloned())
                 {
                     Err(euids)
                 } else {
-                    Ok(self)
+                    Ok(())
                 }
             }
-            ActionConstraint::Eq(ref euid) => {
+            ActionConstraint::Eq(euid) => {
                 if euid.is_action() {
-                    Ok(self)
+                    Ok(())
                 } else {
                     Err(nonempty![euid.clone()])
                 }
             }
             #[cfg(feature = "tolerant-ast")]
-            ActionConstraint::ErrorConstraint => Ok(self),
+            ActionConstraint::ErrorConstraint => Ok(()),
         }
+    }
+
+    /// Check that all of the EUIDs in an action constraint have the type
+    /// `Action`, under an arbitrary namespace. Consumes and returns `self` on
+    /// success.
+    pub fn contains_only_action_types(self) -> Result<Self, NonEmpty<Arc<EntityUID>>> {
+        self.check_action_types()?;
+        Ok(self)
     }
 }
 

@@ -170,6 +170,7 @@ impl Residual {
 
 impl TryFrom<Residual> for Value {
     type Error = ();
+    /// INVARIANT: TPE evaluator assumes this function cannot error if `value.is_concrete()`
     fn try_from(value: Residual) -> std::result::Result<Self, Self::Error> {
         match value {
             Residual::Concrete { value, .. } => Ok(value),
@@ -476,6 +477,16 @@ impl Residual {
     pub fn is_error(&self) -> bool {
         matches!(self, Residual::Error { .. })
     }
+
+    /// If a residual is a concrete value
+    pub fn is_concrete(&self) -> bool {
+        matches!(self, Residual::Concrete { .. })
+    }
+
+    /// If a residual is still partially unknown
+    pub fn is_partial(&self) -> bool {
+        matches!(self, Residual::Partial { .. })
+    }
 }
 
 /// Conversion from `Residual` to `Expr` so that we can use the concrete evaluator for re-authorization
@@ -558,31 +569,18 @@ impl From<Residual> for Expr {
 #[cfg(test)]
 pub(super) mod test {
     use super::*;
-    use crate::ast::{ActionConstraint, PrincipalConstraint, ResourceConstraint, SlotId, Template};
+    use crate::ast::SlotId;
     use crate::extensions::Extensions;
     use crate::parser::parse_expr;
-    use crate::tpe::request::{PartialEntityUID, PartialRequest};
-    use crate::validator::typecheck::{PolicyCheck, Typechecker};
+    use crate::tpe::request::PartialRequest;
+    use crate::tpe::test_utils::parse_partial_euid;
     use crate::validator::types::BoolType;
-    use crate::validator::{ValidationMode, Validator, ValidatorSchema};
+    use crate::validator::ValidatorSchema;
     use cool_asserts::assert_matches;
     use similar_asserts::assert_eq;
 
     #[track_caller]
     pub(crate) fn parse_typed_expr(expr_str: &str, slot_env: &SlotEnv) -> Expr<Option<Type>> {
-        let expr = parse_expr(expr_str).unwrap();
-        let policy_id = crate::ast::PolicyID::from_string("test");
-        let t = Template::new_shared(
-            policy_id,
-            None,
-            Arc::new(Annotations::default()),
-            Effect::Permit,
-            PrincipalConstraint::any(),
-            ActionConstraint::any(),
-            ResourceConstraint::any(),
-            Some(Arc::new(expr)),
-        );
-
         let schema = ValidatorSchema::from_cedarschema_str(r#"
             entity User in Organization { foo: Bool, str: String, num: Long, period: __cedar::duration, set: Set<String> } tags String;
             entity Organization;
@@ -593,52 +591,16 @@ pub(super) mod test {
         .unwrap()
         .0;
 
-        let typechecker = Typechecker::new(&schema, ValidationMode::Strict);
-
         let request = PartialRequest::new(
-            PartialEntityUID {
-                ty: "User".parse().unwrap(),
-                eid: None,
-            },
+            parse_partial_euid("User"),
             r#"Action::"get""#.parse().unwrap(),
-            PartialEntityUID {
-                ty: "Document".parse().unwrap(),
-                eid: None,
-            },
+            parse_partial_euid("Document"),
             None,
             &schema,
         )
         .unwrap();
-        let env = request
-            .find_request_env(&schema)
-            .unwrap()
-            .link_slot_env(slot_env);
 
-        let errs: Vec<_> = Validator::validate_entity_types_and_literals(&schema, &t).collect();
-        if !errs.is_empty() {
-            panic!("unexpected type error in expression");
-        }
-        match typechecker.typecheck_by_single_request_env(&t, &env) {
-            PolicyCheck::Success(expr) => expr,
-            PolicyCheck::Fail(errs) => {
-                println!("got {} type errors", errs.len());
-                for e in errs {
-                    println!("{:?}", miette::Report::new(e));
-                }
-                panic!("unexpected type error in expression")
-            }
-            PolicyCheck::Irrelevant(errs, expr) => {
-                if errs.is_empty() {
-                    expr
-                } else {
-                    println!("got {} type errors", errs.len());
-                    for e in errs {
-                        println!("{:?}", miette::Report::new(e));
-                    }
-                    panic!("unexpected type error in expression")
-                }
-            }
-        }
+        crate::tpe::test_utils::parse_typed_expr(expr_str, &request, &schema, slot_env)
     }
 
     #[track_caller]
@@ -660,17 +622,12 @@ pub(super) mod test {
         assert_eq!(
             Expr::from(
                 Residual::try_from_typed_expr(
-                    &parse_typed_expr(
-                        "principal == ?principal && resource in ?resource",
-                        &env
-                    ),
+                    &parse_typed_expr("principal == ?principal && resource in ?resource", &env),
                     &env
                 )
                 .unwrap()
             ),
-            // extra `true &&` because `parse_type_expr` constructs a policy for typechecking
-            parse_expr(r#"true && (true && (true && (principal == User::"alice" && resource in Organization::"org")))"#)
-                .unwrap()
+            parse_expr(r#"principal == User::"alice" && resource in Organization::"org""#).unwrap()
         );
     }
 
@@ -875,10 +832,7 @@ pub(super) mod test {
     }
 
     fn assert_eq_expr(expr_str: &str) {
-        // The unconstrained
-        let e: Expr = format!("true && (true && (true && ({})))", expr_str)
-            .parse()
-            .unwrap();
+        let e: Expr = expr_str.parse().unwrap();
         let residual = parse_residual(expr_str);
         let e2 = Expr::from(residual);
         println!("e: {}", e);

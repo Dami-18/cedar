@@ -36,13 +36,13 @@ use smol_str::SmolStr;
 use smol_str::ToSmolStr;
 use std::collections::{hash_map::Entry, BTreeSet, HashMap, HashSet};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::validator::{
     cedar_schema::SchemaWarning,
     json_schema,
     partition_nonempty::PartitionNonEmpty,
-    types::{Attributes, EntityKind, OpenTag, RequestEnv, Type, TypeIterator},
+    types::{Attributes, EntityKind, OpenTag, RequestEnv, Type, TypeIterator, UnlinkedRequestEnv},
     ValidationMode,
 };
 
@@ -161,6 +161,13 @@ impl LocatedType {
     /// Replace `self.loc` with `loc`. No-op if the `extended-schema` feature is
     /// not enabled.
     pub fn with_loc(self, _loc: Option<&Loc>) -> Self {
+        #[cfg_attr(
+            not(feature = "extended-schema"),
+            expect(
+                clippy::unnecessary_struct_initialization,
+                reason = "changes loc when extended-schema is enabled"
+            )
+        )]
         Self {
             #[cfg(feature = "extended-schema")]
             loc: _loc.cloned(),
@@ -194,11 +201,13 @@ pub struct LocatedCommonType {
     pub name: SmolStr,
 
     /// Common type name source location if available
-    #[educe(Eq(ignore))]
+    #[educe(PartialEq(ignore))]
+    #[educe(Hash(ignore))]
     pub name_loc: Option<Loc>,
 
     /// Common type definition source location if available
-    #[educe(Eq(ignore))]
+    #[educe(PartialEq(ignore))]
+    #[educe(Hash(ignore))]
     pub type_loc: Option<Loc>,
 }
 
@@ -226,11 +235,13 @@ pub struct LocatedNamespace {
     /// Name of namespace
     pub name: SmolStr,
     /// Namespace name source location if available
-    #[educe(Eq(ignore))]
+    #[educe(PartialEq(ignore))]
+    #[educe(Hash(ignore))]
     pub name_loc: Option<Loc>,
 
     /// Namespace definition source location if available
-    #[educe(Eq(ignore))]
+    #[educe(PartialEq(ignore))]
+    #[educe(Hash(ignore))]
     pub def_loc: Option<Loc>,
 }
 
@@ -253,6 +264,12 @@ pub struct ValidatorSchema {
     /// `Entity` from the `ValidatorSchema` is O(N) as of this writing, but with
     /// this cache it's O(1).
     pub(crate) actions: HashMap<EntityUID, Arc<Entity>>,
+
+    /// Cache of the unlinked request-env set; see
+    /// [`ValidatorSchema::unlinked_envs_owned`]. Derived data, so it is ignored
+    /// for equality.
+    #[educe(PartialEq(ignore))]
+    unlinked_envs_cache: OnceLock<Vec<UnlinkedRequestEnv>>,
 
     #[cfg(feature = "extended-schema")]
     #[educe(PartialEq(ignore))]
@@ -299,7 +316,10 @@ impl TryFrom<json_schema::Fragment<RawName>> for ValidatorSchema {
 }
 
 impl ValidatorSchema {
-    /// Construct a new `ValidatorSchema` from a set of `ValidatorEntityType`s and `ValidatorActionId`s
+    /// Construct a new `ValidatorSchema` from a set of `ValidatorEntityType`s and `ValidatorActionId`s.
+    ///
+    /// The caller must ensure that there are no duplicate entity type names or action names
+    /// in the input. Duplicates are silently collapsed (last entry wins).
     pub fn new(
         entity_types: impl IntoIterator<Item = ValidatorEntityType>,
         action_ids: impl IntoIterator<Item = ValidatorActionId>,
@@ -338,6 +358,7 @@ impl ValidatorSchema {
             entity_types,
             action_ids,
             actions,
+            unlinked_envs_cache: OnceLock::new(),
             #[cfg(feature = "extended-schema")]
             common_types,
             #[cfg(feature = "extended-schema")]
@@ -420,32 +441,46 @@ impl ValidatorSchema {
         &self,
         mode: ValidationMode,
     ) -> impl Iterator<Item = RequestEnv<'_>> + '_ {
-        // For every action compute the cross product of the principal and
-        // resource applies_to sets.
-        self.action_ids()
-            .flat_map(|action| {
-                action.applies_to_principals().flat_map(|principal| {
-                    action
-                        .applies_to_resources()
-                        .map(|resource| RequestEnv::DeclaredAction {
-                            principal,
-                            action: &action.name,
-                            resource,
-                            context: &action.context,
-                            principal_slot: None,
-                            resource_slot: None,
-                        })
+        // Cheap borrowed views over the cached set (see
+        // `unlinked_envs_owned`). Partial validation additionally considers
+        // `RequestEnv::UndeclaredAction`, which carries no data.
+        self.unlinked_envs_owned()
+            .iter()
+            .map(UnlinkedRequestEnv::as_request_env)
+            .chain(mode.is_partial().then_some(RequestEnv::UndeclaredAction))
+    }
+
+    /// Returns the cached set of unlinked request envs, computing it on first
+    /// use. Unlike [`ValidatorSchema::unlinked_request_envs`], this owns its
+    /// data and is cached on the schema, so it is built once and reused across
+    /// all typechecking operations (and requests) rather than reconstructed per
+    /// `Typechecker`/policy.
+    ///
+    /// The set is identical for strict and permissive validation. Partial
+    /// validation additionally considers [`RequestEnv::UndeclaredAction`], which
+    /// carries no data and so is left for the caller to append.
+    pub(crate) fn unlinked_envs_owned(&self) -> &[UnlinkedRequestEnv] {
+        self.unlinked_envs_cache.get_or_init(|| {
+            // For every action, the cross product of its principal and resource
+            // applies_to sets. The context type is shared (via `Arc`) across all
+            // the P×R envs of a single action.
+            self.action_ids()
+                .flat_map(|action| {
+                    let ctx = Arc::new(action.context.clone());
+                    action.applies_to_principals().flat_map(move |principal| {
+                        let ctx = Arc::clone(&ctx);
+                        action
+                            .applies_to_resources()
+                            .map(move |resource| UnlinkedRequestEnv {
+                                principal: principal.clone(),
+                                action: action.name.clone(),
+                                resource: resource.clone(),
+                                context: Arc::clone(&ctx),
+                            })
+                    })
                 })
-            })
-            .chain(if mode.is_partial() {
-                // A partial schema might not list all actions, and may not
-                // include all principal and resource types for the listed ones.
-                // So we typecheck with a fully unknown request to handle these
-                // missing cases.
-                Some(RequestEnv::UndeclaredAction)
-            } else {
-                None
-            })
+                .collect()
+        })
     }
 
     /// Returns an iterator over all the entity types that can be a parent of `ty`
@@ -493,6 +528,7 @@ impl ValidatorSchema {
             entity_types: HashMap::new(),
             action_ids: HashMap::new(),
             actions: HashMap::new(),
+            unlinked_envs_cache: OnceLock::new(),
             #[cfg(feature = "extended-schema")]
             common_types: HashSet::new(),
             #[cfg(feature = "extended-schema")]
@@ -1132,15 +1168,8 @@ impl ValidatorSchema {
             }
         }
         // Check actions: appliesTo references declared entity types, and
-        // descendants reference declared actions, and action entity types have
-        // basename `Action`
+        // descendants reference declared actions.
         for action in self.action_ids.values() {
-            if !action.name().entity_type().is_action() {
-                return Err(InvalidActionTypeError {
-                    uid: action.name().clone(),
-                }
-                .into());
-            }
             for ety in action.principals().chain(action.resources()) {
                 if !self.entity_types.contains_key(ety) {
                     undeclared_entities.push(ety.clone());
@@ -1167,7 +1196,7 @@ impl ValidatorSchema {
         for ty in self.leaf_types().unique() {
             if let Type::Entity(EntityKind::Entity(lub)) = ty {
                 for e in lub.iter() {
-                    if !self.entity_types.contains_key(e) {
+                    if !self.is_known_entity_type(e) {
                         undeclared.push(e.clone());
                     }
                 }
@@ -1179,6 +1208,8 @@ impl ValidatorSchema {
         Ok(())
     }
 
+    /// Check that all the extension types appearing in the types of the schema are known extension
+    /// types.
     fn check_extension_types_wf(&self) -> std::result::Result<(), SchemaError> {
         let extensions = Extensions::all_available();
         let valid_ext_types: HashSet<_> = extensions.ext_types().collect();
@@ -1194,10 +1225,55 @@ impl ValidatorSchema {
         Ok(())
     }
 
+    /// Checks that declarations are well-formed:
+    /// - [`self.entity_types`] does not declare actions,
+    /// - [`self.action_ids`] declares only actions.
+    fn check_decls_wf(&self) -> std::result::Result<(), SchemaError> {
+        for (et, _) in self.entity_types.iter() {
+            // An `*::Action` should not be in entity_types, including `Action`.
+            if et.is_action() {
+                return Err(SchemaError::ActionEntityTypeDeclared(
+                    ActionEntityTypeDeclaredError {},
+                ));
+            }
+        }
+        // An action should be an `*::Action`, otherwise it's invalid
+        // Not that the rfc_70 shadowing checks in `try_validate` will check that
+        // the `Action` entity type is not redeclared.
+        for (at, _) in self.action_ids.iter() {
+            if !at.is_action() {
+                return Err(SchemaError::InvalidActionType(InvalidActionTypeError {
+                    uid: at.clone(),
+                }));
+            }
+        }
+        Ok(())
+    }
+
     /// Validate that a schema is well-formed according to the rules of the schema language.
     /// This is useful when the schema has been constructed directly from Rust code,
     /// without going through the JSON or Cedar schema syntax, and thus may not have
     /// been checked for well-formedness by the JSON or Cedar schema parsers.
+    ///
+    /// More specifically, this checks the following:
+    /// - all entity types referenced are declared,
+    /// - all extension types in the schema are known extensions,
+    /// - `entity_types` does not declare actions and `action_ids` declares only actions,
+    /// - enum entities do not appear as descendants,
+    /// - RFC 70 shadowing rules are satisfied.
+    ///
+    /// Additionally, this recomputes the transitive closure computation for entity types
+    /// and actions.
+    ///
+    /// This does NOT check the following, which must be ensured before construction:
+    /// - duplicate entity type or action declarations (duplicates are silently collapsed
+    ///   by [`ValidatorSchema::new`] since it collects into a `HashMap`; the protobuf
+    ///   conversion path detects duplicates before calling `new`),
+    /// - that context types are records
+    /// - common type resolution
+    ///
+    // Note: the invariants that are not checked and mentioned above are guaranteed
+    // by construction through the parsing paths, and the construction from protobuf.
     //
     // Note: The checks here partially overlap with `check_for_undeclared` and
     // the TC computation in `from_schema_fragments`. We cannot reuse those
@@ -1208,14 +1284,17 @@ impl ValidatorSchema {
     // simpler checks tailored to that representation (and also cover tags,
     // which `check_for_undeclared` does not inspect).
     pub fn try_validate(mut self) -> std::result::Result<Self, SchemaError> {
-        self.check_hierarchy_wf()?;
         self.check_references_wf()?;
         self.check_extension_types_wf()?;
-        // Recompute transitive closure for entity types and actions,
-        // which also detects cycles in the action hierarchy.
+        self.check_decls_wf()?;
+        // Recompute transitive closure for entity types and actions
         compute_tc(&mut self.entity_types, false)
             .map_err(|e| EntityTypeTransitiveClosureError::from(Box::new(e)))?;
+        // Also checks that the action hierarchy does not contain cycles.
         compute_tc(&mut self.action_ids, true)?;
+        // Check hierarchy well-formedness AFTER transitive closure so that
+        // transitive descendants are included in the enum-in-hierarchy check.
+        self.check_hierarchy_wf()?;
         self.actions = Self::action_entities_iter(&self.action_ids)
             .map(|e| (e.uid().clone(), Arc::new(e)))
             .collect();
@@ -1670,7 +1749,7 @@ pub(crate) mod test {
     };
 
     use crate::validator::json_schema;
-    use crate::validator::types::Type;
+    use crate::validator::types::{AttributeType, Type};
 
     use crate::test_utils::{expect_err, ExpectedErrorMessageBuilder};
     use cool_asserts::assert_matches;
@@ -2271,6 +2350,96 @@ pub(crate) mod test {
             schema,
             Err(SchemaError::ActionEntityTypeDeclared(_))
         ));
+    }
+
+    #[test]
+    fn try_validate_rejects_action_entity_type() {
+        let action_type = EntityType::from_normalized_str("Action").unwrap();
+        let schema = ValidatorSchema::new(
+            [ValidatorEntityType::new_standard(
+                action_type,
+                [],
+                Attributes::with_attributes([]),
+                OpenTag::ClosedAttributes,
+                None,
+                None,
+            )],
+            [],
+        );
+        assert_matches!(
+            schema.try_validate(),
+            Err(SchemaError::ActionEntityTypeDeclared(_))
+        );
+    }
+
+    /// `check_references_wf` should accept entity attributes that reference Action entity types
+    #[test]
+    fn try_validate_accepts_action_entity_type_reference_in_attribute() {
+        let user_type = EntityType::from_normalized_str("User").unwrap();
+        let action_type = EntityType::from_normalized_str("Foo::Action").unwrap();
+
+        // User entity type has an attribute of type Entity that references Foo::Action
+        let attr_type =
+            AttributeType::required_attribute(Arc::new(Type::named_entity_reference(action_type)));
+        let schema = ValidatorSchema::new(
+            [ValidatorEntityType::new_standard(
+                user_type,
+                [],
+                Attributes::with_attributes([("last_action".into(), attr_type)]),
+                OpenTag::ClosedAttributes,
+                None,
+                None,
+            )],
+            [],
+        );
+
+        // Should succeed — Action entity types are valid references
+        assert_matches!(schema.try_validate(), Ok(_));
+    }
+
+    /// Regression test: enum entity types reachable only via transitive
+    /// descendants (A -> B -> EnumC) must be rejected by `try_validate`.
+    /// Before the fix, `check_hierarchy_wf` ran before `compute_tc`, so it
+    /// only saw direct descendants and missed transitive enum descendants.
+    #[test]
+    fn try_validate_rejects_transitive_enum_descendant() {
+        use crate::ast::Eid;
+
+        // Set up: A has direct descendant B, B has direct descendant EnumC.
+        // After TC, A should transitively have EnumC as a descendant.
+        let type_a = EntityType::from_normalized_str("A").unwrap();
+        let type_b = EntityType::from_normalized_str("B").unwrap();
+        let type_enum_c = EntityType::from_normalized_str("EnumC").unwrap();
+
+        let entity_a = ValidatorEntityType::new_standard(
+            type_a,
+            [type_b.clone()], // direct descendant: B only
+            Attributes::with_attributes([]),
+            OpenTag::ClosedAttributes,
+            None,
+            None,
+        );
+        let entity_b = ValidatorEntityType::new_standard(
+            type_b,
+            [type_enum_c.clone()], // direct descendant: EnumC
+            Attributes::with_attributes([]),
+            OpenTag::ClosedAttributes,
+            None,
+            None,
+        );
+        let entity_enum_c = ValidatorEntityType::new_enum(
+            type_enum_c.clone(),
+            [],
+            NonEmpty::new(Eid::new("val1")),
+            None,
+        );
+
+        let schema = ValidatorSchema::new([entity_a, entity_b, entity_enum_c], []);
+
+        assert_matches!(
+            schema.try_validate(),
+            Err(SchemaError::EnumEntityInHierarchy(_))
+        );
     }
 
     #[test]

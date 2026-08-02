@@ -1532,6 +1532,13 @@ fn visualize_entities_parses_as_dot(
     "sample-data/tiny_sandboxes/sample1/tests-unexpected-error.json",
     CedarExitCode::Failure
 )]
+// Evaluation produces a runtime error, but the test does not expect one
+#[case(
+    "sample-data/tiny_sandboxes/sample2/policy.cedar",
+    "sample-data/tiny_sandboxes/sample2/schema.cedarschema.json",
+    "sample-data/tiny_sandboxes/sample2/tests-unexpected-error.json",
+    CedarExitCode::Failure
+)]
 #[case(
     "sample-data/tiny_sandboxes/sample1/policy.cedar",
     "sample-data/tiny_sandboxes/sample1/schema.cedarschema.json",
@@ -1678,7 +1685,7 @@ fn test_tpe() {
         .arg(schema)
         .assert()
         .stdout(contains_residuals())
-        .code(0);
+        .code(4);
 
     cargo::cargo_bin_cmd!("cedar")
         .arg("tpe")
@@ -1714,7 +1721,7 @@ fn test_tpe() {
         .arg(schema)
         .assert()
         .stdout(contains_residuals())
-        .code(0);
+        .code(4);
 }
 
 #[test]
@@ -1778,7 +1785,7 @@ when {{ resource.isPublic }};"#
                 r#"permit(principal, action, resource) when { (principal == User::"Alice") && (resource.isPublic) };"#
             )),
         )
-        .code(0);
+        .code(4);
 
     // Now providing principal eid, equality between slot and principal
     // evaluates, but we still have a residual
@@ -1806,7 +1813,7 @@ when {{ resource.isPublic }};"#
                 "permit(principal, action, resource) when { resource.isPublic };",
             )),
         )
-        .code(0);
+        .code(4);
 
     // Still no resource eid, but slot/principal equality is false for Bob, so deny
     cargo::cargo_bin_cmd!("cedar")
@@ -1868,6 +1875,110 @@ when {{ resource.isPublic }};"#
         .assert()
         .stdout(predicate::str::contains("ALLOW"))
         .code(0);
+}
+
+#[test]
+#[cfg(feature = "tpe")]
+fn test_tpe_invalid_policies() {
+    let entities: &str = "sample-data/tpe_rfc/entities.json";
+    let schema: &str = "sample-data/tpe_rfc/schema.cedarschema";
+
+    let mut policies_file = tempfile::NamedTempFile::new().expect("Failed to create policies file");
+    writeln!(
+        policies_file,
+        r#"permit ( principal, action == Action::"View", resource) when {{ resource.nonexistent }};"#
+    ).expect("Failed to write policies file");
+    let policies_path = policies_file.path().to_str().unwrap();
+
+    let output = cargo::cargo_bin_cmd!("cedar")
+        .env("NO_COLOR", "1")
+        .arg("tpe")
+        .arg("--principal-type")
+        .arg("User")
+        .arg("--principal-eid")
+        .arg("Alice")
+        .arg("-a")
+        .arg(r#"Action::"View""#)
+        .arg("--resource-type")
+        .arg("Document")
+        .arg("-p")
+        .arg(policies_path)
+        .arg("--entities")
+        .arg(entities)
+        .arg("-s")
+        .arg(schema)
+        .output()
+        .expect("failed to run cedar");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    insta::assert_snapshot!(stdout, @r#"
+
+      × policy failed to validate against the schema
+
+    Error: 
+      × for policy `policy0`, attribute `nonexistent` on entity type `Document`
+      │ not found
+       ╭────
+     1 │ permit ( principal, action == Action::"View", resource) when { resource.nonexistent };
+       ·                                                                ────────────────────
+       ╰────
+      help: did you mean `owner`?
+    "#);
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+#[cfg(feature = "tpe")]
+fn test_tpe_invalid_entities() {
+    let policies: &str = "sample-data/tpe_rfc/policies.cedar";
+    let schema: &str = "sample-data/tpe_rfc/schema.cedarschema";
+
+    // `isPublic` is declared as `Bool` in the schema, but this entity gives it a
+    // string value, so entity parsing fails schema conformance.
+    let entities = serde_json::json!(
+    [{
+        "uid": { "type": "Document", "id": "d1" },
+        "attrs": {
+            "isPublic": "not_a_bool",
+            "owner": { "__entity": { "type": "User", "id": "Alice" } }
+        },
+        "parents": []
+    }]);
+    let mut entities_file = tempfile::NamedTempFile::new().expect("Failed to create entities file");
+    serde_json::to_writer(&mut entities_file, &entities).unwrap();
+    let entities_path = entities_file.path().to_str().unwrap();
+
+    let output = cargo::cargo_bin_cmd!("cedar")
+        .env("NO_COLOR", "1")
+        .arg("tpe")
+        .arg("--principal-type")
+        .arg("User")
+        .arg("--principal-eid")
+        .arg("Alice")
+        .arg("-a")
+        .arg(r#"Action::"View""#)
+        .arg("--resource-type")
+        .arg("Document")
+        .arg("-p")
+        .arg(policies)
+        .arg("--entities")
+        .arg(entities_path)
+        .arg("-s")
+        .arg(schema)
+        .output()
+        .expect("failed to run cedar");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut settings = insta::Settings::clone_current();
+    settings.add_filter(r"/tmp/\S+", "[TEMPFILE]");
+    settings.bind(|| {
+        insta::assert_snapshot!(stdout, @r#"
+
+        × failed to parse entities from file [TEMPFILE]
+        ╰─▶ in attribute `isPublic` on `Document::"d1"`, type mismatch: value was
+            expected to have type bool, but it actually has type string:
+            `"not_a_bool"`
+        "#);
+    });
+    assert_eq!(output.status.code(), Some(1));
 }
 
 #[rstest]
@@ -2080,10 +2191,10 @@ fn link_file_cant_read() {
     let mut settings = insta::Settings::clone_current();
     settings.add_filter(r"/tmp/[^ ']+/linked", "[TEMPDIR]/linked");
     settings.bind(|| {
-        insta::assert_snapshot!(stdout, @r###"
-        × failed to open links file '[TEMPDIR]/linked': Permission denied (os
-        │ error 13)
-        "###);
+        insta::assert_snapshot!(stdout, @"
+        × failed to open links file '[TEMPDIR]/linked'
+        ╰─▶ Permission denied (os error 13)
+        ");
     });
     assert!(!output.status.success());
 }
@@ -2131,11 +2242,11 @@ fn auth_link_file_does_not_exist() {
     let mut settings = insta::Settings::clone_current();
     settings.add_filter(r"/tmp/[^ ']+/linked", "[TEMPDIR]/linked");
     settings.bind(|| {
-        insta::assert_snapshot!(stdout, @r###"
+        insta::assert_snapshot!(stdout, @"
 
-        × failed to open links file '[TEMPDIR]/linked': No such file or
-        │ directory (os error 2)
-        "###);
+        × failed to open links file '[TEMPDIR]/linked'
+        ╰─▶ No such file or directory (os error 2)
+        ");
     });
     assert!(!output.status.success());
     assert!(

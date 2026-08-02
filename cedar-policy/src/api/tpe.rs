@@ -106,6 +106,8 @@ impl PartialRequest {
 }
 
 /// Like [`PartialRequest`] but only `resource` can be unknown
+///
+/// Intended for use with [`PolicySet::query_resource`].
 #[doc = include_str!("../../experimental_warning.md")]
 #[repr(transparent)]
 #[derive(Debug, Clone, RefCast)]
@@ -130,38 +132,56 @@ impl ResourceQueryRequest {
         .map(Self)
     }
 
-    /// Convert [`ResourceQueryRequest`] to a [`Request`] by providing the resource [`EntityId`]
+    fn principal(&self) -> EntityUid {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "constructor requires concrete principal"
+        )]
+        EntityUid(self.0 .0.principal().clone().try_into().unwrap())
+    }
+
+    fn context(&self) -> Context {
+        #[expect(clippy::unwrap_used, reason = "constructor requires concrete context")]
+        let context_attrs = self.0 .0.context_attrs().unwrap();
+        #[expect(
+            clippy::unwrap_used,
+            reason = "building context from BTreeMap iter, so no duplicates are possible"
+        )]
+        Context::from_pairs(
+            context_attrs
+                .iter()
+                .map(|(a, v)| (a.to_string(), RestrictedExpression(v.clone().into()))),
+        )
+        .unwrap()
+    }
+
+    /// Convert this to a [`Request`] by providing the resource [`EntityId`]
+    ///
+    /// Even though the partial request was already validated in [`ResourceQueryRequest::new`],
+    /// to ensure that the concrete request returned here is valid we still need to
+    /// check the resource entity id. If the resource has an enum entity type,
+    /// then its id must be one of the listed instances of that type.
     pub fn to_request(
         &self,
         resource_id: EntityId,
         schema: Option<&Schema>,
     ) -> Result<Request, RequestValidationError> {
-        #[expect(
-            clippy::unwrap_used,
-            reason = "various fields are validated through the constructor"
-        )]
         Request::new(
-            EntityUid(self.0 .0.get_principal().try_into().unwrap()),
-            EntityUid(self.0 .0.get_action()),
+            self.principal(),
+            EntityUid(self.0 .0.action().clone()),
             EntityUid::from_type_name_and_id(
-                EntityTypeName(self.0 .0.get_resource_type()),
+                EntityTypeName(self.0 .0.resource_type().clone()),
                 resource_id,
             ),
-            Context::from_pairs(
-                self.0
-                     .0
-                    .get_context_attrs()
-                    .unwrap()
-                    .iter()
-                    .map(|(a, v)| (a.to_string(), RestrictedExpression(v.clone().into()))),
-            )
-            .unwrap(),
+            self.context(),
             schema,
         )
     }
 }
 
 /// Like [`PartialRequest`] but only `principal` can be unknown
+///
+/// Intended for use with [`PolicySet::query_principal`].
 #[doc = include_str!("../../experimental_warning.md")]
 #[repr(transparent)]
 #[derive(Debug, Clone, RefCast)]
@@ -186,32 +206,45 @@ impl PrincipalQueryRequest {
         .map(Self)
     }
 
-    /// Convert [`PrincipalQueryRequest`] to a [`Request`] by providing the principal [`EntityId`]
+    fn resource(&self) -> EntityUid {
+        #[expect(clippy::unwrap_used, reason = "constructor requires concrete resource")]
+        EntityUid(self.0 .0.resource().clone().try_into().unwrap())
+    }
+
+    fn context(&self) -> Context {
+        #[expect(clippy::unwrap_used, reason = "constructor requires concrete context")]
+        let context_attrs = self.0 .0.context_attrs().unwrap();
+        #[expect(
+            clippy::unwrap_used,
+            reason = "building context from BTreeMap iter, so no duplicates are possible"
+        )]
+        Context::from_pairs(
+            context_attrs
+                .iter()
+                .map(|(a, v)| (a.to_string(), RestrictedExpression(v.clone().into()))),
+        )
+        .unwrap()
+    }
+
+    /// Convert this to a [`Request`] by providing the principal [`EntityId`]
+    ///
+    /// Even though the partial request was already validated in [`PrincipalQueryRequest::new`],
+    /// to ensure that the concrete request returned here is valid we still need to
+    /// check the principal entity id. If the principal has an enum entity type,
+    /// then its id must be one of the listed instances of that type.
     pub fn to_request(
         &self,
         principal_id: EntityId,
         schema: Option<&Schema>,
     ) -> Result<Request, RequestValidationError> {
-        #[expect(
-            clippy::unwrap_used,
-            reason = "various fields are validated through the constructor"
-        )]
         Request::new(
             EntityUid::from_type_name_and_id(
-                EntityTypeName(self.0 .0.get_principal_type()),
+                EntityTypeName(self.0 .0.principal_type().clone()),
                 principal_id,
             ),
-            EntityUid(self.0 .0.get_action()),
-            EntityUid(self.0 .0.get_resource().try_into().unwrap()),
-            Context::from_pairs(
-                self.0
-                     .0
-                    .get_context_attrs()
-                    .unwrap()
-                    .iter()
-                    .map(|(a, v)| (a.to_string(), RestrictedExpression(v.clone().into()))),
-            )
-            .unwrap(),
+            EntityUid(self.0 .0.action().clone()),
+            self.resource(),
+            self.context(),
             schema,
         )
     }
@@ -231,7 +264,14 @@ pub struct ActionQueryRequest {
 }
 
 impl ActionQueryRequest {
-    /// Construct a valid [`ActionQueryRequest`] according to a [`Schema`]
+    /// Construct an [`ActionQueryRequest`].
+    ///
+    /// Unlike [`PartialRequest::new`], this constructor cannot validate the
+    /// request because request validation requires knowing the specific action
+    /// being authorized. Further, [`PolicySet::query_action`] cannot report
+    /// request validation errors because it is expected that the
+    /// `principal`, `resource`, and `context` will be invalid for many of the
+    /// actions in the schema.
     pub fn new(
         principal: PartialEntityUid,
         resource: PartialEntityUid,
@@ -366,7 +406,12 @@ impl PartialEntities {
     }
 }
 
-/// A partial version of [`crate::Response`].
+/// A response to a partial authorization request.
+///
+/// Most callers will want to first check if a concrete authorization decision was reached using
+/// [`TpeResponse::decision`] before inspecting the unevaluated policies with
+/// [`TpeResponse::residual_policies`] or resuming evaluation after providing
+/// the missing parts of the request with [`TpeResponse::reauthorize`].
 #[doc = include_str!("../../experimental_warning.md")]
 #[repr(transparent)]
 #[derive(Debug, Clone, RefCast)]
@@ -380,7 +425,16 @@ impl<'a> AsRef<tpe::response::Response<'a>> for TpeResponse<'a> {
 }
 
 impl TpeResponse<'_> {
-    /// Attempt to get the authorization decision
+    /// Get the authorization decision, if TPE reached a concrete decision.
+    ///
+    /// This function can return three possible values:
+    /// * `Some(Decision::Allow)`, when there was enough information in the
+    ///   partial request to concretely decide that the request should be allowed.
+    /// * `Some(Decision::Deny)`, when there was enough information to decide
+    ///   that the request should be denied.
+    /// * `None`, when the partial request did _not_ provide enough information to reach an
+    ///   authorization decision. In this case you can use [`TpeResponse::reauthorize`] to provide
+    ///   the missing parts of the request and reach a concrete decision.
     pub fn decision(&self) -> Option<Decision> {
         self.0.decision()
     }
@@ -404,7 +458,7 @@ impl TpeResponse<'_> {
     /// Get the permit policies that did not reach a concrete value or error for the partial request.
     ///
     /// This function only returns the `PolicyId`s for residual policies.
-    /// To access the residual policy conditions, use [`TpeResponse::nontrivial_residual_policies`].
+    /// To access the residual policy conditions, use [`TpeResponse::residual_policies`].
     ///
     /// These policies could be determining policies _if_ the eventual
     /// concrete authorization decision is `Allow` _and_ they are satisfied by
@@ -433,7 +487,7 @@ impl TpeResponse<'_> {
     ///   policy.
     pub fn true_permits(&self) -> impl Iterator<Item = &PolicyId> {
         self.0
-            .satisfied_permits()
+            .true_permits()
             .map(|rp| PolicyId::ref_cast(rp.get_policy_id()))
     }
 
@@ -463,7 +517,7 @@ impl TpeResponse<'_> {
     /// Get the forbid policies that did not reach a concrete value or error for the partial request.
     ///
     /// This function only returns the `PolicyId`s for residual policies.
-    /// To access the residual policy conditions, use [`TpeResponse::nontrivial_residual_policies`].
+    /// To access the residual policy conditions, use [`TpeResponse::residual_policies`].
     ///
     /// The presence of any residual forbids means that [`TpeResponse::decision`] _cannot_ return
     /// a concrete `Allow` decision. We do not have enough information to say that these forbid
@@ -481,7 +535,7 @@ impl TpeResponse<'_> {
     /// must return a concrete `Deny`.
     pub fn true_forbids(&self) -> impl Iterator<Item = &PolicyId> {
         self.0
-            .satisfied_forbids()
+            .true_forbids()
             .map(|rp| PolicyId::ref_cast(rp.get_policy_id()))
     }
 
@@ -526,20 +580,23 @@ impl TpeResponse<'_> {
             .map_err(Into::into)
     }
 
-    /// Return residuals as [`Policy`]s.
+    /// Returns an iterator of non-trivial (meaning more than just `true`
+    /// or `false`, or an error) residuals as [`Policy`]s.
     ///
-    /// Each returned [`Policy`] inherits its [`PolicyId`](crate::PolicyId) and
+    /// To find policies that reached a concrete value, use, e.g., [`TpeResponse::true_permits`].
+    ///
+    /// Each returned [`Policy`] inherits its [`PolicyId`] and
     /// annotations from the corresponding input policy. Its scope is
     /// unconstrained and its condition is a single `when` clause containing
     /// the residual expression.
     ///
-    /// Use [`TpeResponse::nontrivial_residual_policies`] to skip trivially
-    /// `true` or `false` residuals.
+    /// Call [`Policy::to_pst()`] on each result to get a [`pst::Policy`](crate::pst::Policy)
+    /// for structured inspection.
     ///
-    /// The returned policies can be converted to PST for structured
-    /// inspection of the residual expression tree:
-    ///
-    /// ```text
+    /// ```no_run
+    /// # use cedar_policy::{PolicySet, PartialRequest, PartialEntities, Schema};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let (policy_set, request, entities, schema) : (&PolicySet, &PartialRequest, &PartialEntities, &Schema) = panic!();
     /// let response = policy_set.tpe(&request, &entities, &schema)?;
     /// for policy in response.residual_policies() {
     ///     let pst_policy = policy.to_pst()?;
@@ -547,29 +604,61 @@ impl TpeResponse<'_> {
     ///         // inspect the residual expression via pst::Clause / pst::Expr
     ///     }
     /// }
+    /// # Ok(())
+    /// # }
     /// ```
+    ///
+    /// When inspecting these policies, be aware that they may contain
+    /// [`pst::Expr::ResidualError`](crate::pst::Expr::ResidualError) nodes
+    /// which do not normally exist in Cedar expressions. These represent
+    /// subexpressions which are statically known to error; however, the whole
+    /// residual policy might or might not error, regardless of whether it
+    /// contains these nodes.
     pub fn residual_policies(&self) -> impl Iterator<Item = Policy> + '_ {
         self.0
-            .residual_policies()
+            .residual_permits()
+            .chain(self.0.residual_forbids())
             .map(|p| Policy::from_ast(p.clone().into()))
     }
 
-    /// Returns an iterator of non-trivial (meaning more than just `true`
-    /// or `false`) residuals as [`Policy`]s.
+    /// Return all residuals as [`Policy`]s, including concretely `true`, `false`, and error residuals.
     ///
     /// Each returned [`Policy`] inherits its [`PolicyId`](crate::PolicyId) and
     /// annotations from the corresponding input policy. Its scope is
     /// unconstrained and its condition is a single `when` clause containing
     /// the residual expression.
     ///
-    /// Call [`Policy::to_pst()`] on each result to get a [`crate::pst::Policy`]
-    /// for structured inspection. Residual expressions may contain
-    /// [`crate::pst::Expr::ResidualError`] nodes indicating subexpressions that
-    /// would error at runtime; use [`crate::pst::Expr::has_error()`] to check.
-    pub fn nontrivial_residual_policies(&'_ self) -> impl Iterator<Item = Policy> + '_ {
+    /// Use [`TpeResponse::residual_policies`] to skip `true`, `false`, and error residuals.
+    ///
+    /// See [`TpeResponse::residual_policies`] for documentation on how to inspect policies using the PST.
+    pub fn policies(&self) -> impl Iterator<Item = Policy> + '_ {
         self.0
-            .residual_permits()
-            .chain(self.0.residual_forbids())
+            .policies()
+            .map(|p| Policy::from_ast(p.clone().into()))
+    }
+
+    /// Return all residuals as a [`PolicySet`], including concretely `true`, `false`, and error residuals.
+    ///
+    /// This returns exactly the same policies as [`TpeResponse::policies`], but collected into a policy set.
+    pub fn policy_set(&self) -> PolicySet {
+        PolicySet::from_ast(self.0.policy_set())
+    }
+
+    /// Deprecated alias for [`TpeResponse::residual_policies`]
+    #[deprecated(
+        since = "4.12.0",
+        note = "TpeResponse::residual_policies now returns only non-trivial residual policies"
+    )]
+    pub fn nontrivial_residual_policies(&'_ self) -> impl Iterator<Item = Policy> + '_ {
+        self.residual_policies()
+    }
+
+    /// Get the residual policy for a specific [`PolicyId`], if it exists.
+    ///
+    /// See [`TpeResponse::residual_policies`] for documentation on how to inspect policies using the PST.
+    pub fn get_policy(&self, id: &PolicyId) -> Option<Policy> {
+        self.0
+            .get_residual_policy(id.as_ref())
             .map(|p| Policy::from_ast(p.clone().into()))
     }
 }
@@ -637,13 +726,11 @@ impl EntityLoader for TestEntityLoader<'_> {
 impl PolicySet {
     /// Perform type-aware partial evaluation on this [`PolicySet`].
     ///
-    /// If successful, the result is a [`TpeResponse`] containing residual
-    /// policies ready for re-authorization. Use
-    /// [`TpeResponse::residual_policies()`] or
-    /// [`TpeResponse::nontrivial_residual_policies()`] to get the residuals
-    /// as [`Policy`] objects, then call [`Policy::to_pst()`] to convert them
-    /// to [`crate::pst::Policy`] for structured inspection of the residual
-    /// expression tree.
+    /// If successful, the result is a [`TpeResponse`] containing the authorization decision, if
+    /// one was reached, and residual policies ready for re-authorization. Use [`TpeResponse::decision`]
+    /// to check the decision and [`TpeResponse::residual_policies`] to get the residuals as
+    /// [`Policy`] objects. You can then call [`Policy::to_pst`] to convert them to [`pst::Policy`](crate::pst::Policy)
+    /// for structured inspection of the residual expression tree.
     #[doc = include_str!("../../experimental_warning.md")]
     pub fn tpe<'a>(
         &self,
@@ -691,45 +778,38 @@ impl PolicySet {
         schema: &Schema,
     ) -> Result<impl Iterator<Item = EntityUid>, PermissionQueryError> {
         let partial_entities = PartialEntities::from_concrete(entities.clone(), schema)?;
-        let residuals = self.tpe(&request.0, &partial_entities, schema)?;
-        #[expect(
-            clippy::unwrap_used,
-            reason = "policy set construction should succeed because there shouldn't be any policy id conflicts"
-        )]
-        let policies = &Self::from_policies(
-            residuals
-                .0
-                .residual_policies()
-                .map(|p| Policy::from_ast(p.clone().into())),
-        )
-        .unwrap();
-        #[expect(
-            clippy::unwrap_used,
-            reason = "request construction should succeed because each entity passes validation"
-        )]
-        match residuals.decision() {
+        let tpe_response = self.tpe(&request.0, &partial_entities, schema)?;
+        let policies = tpe_response.policy_set();
+        match tpe_response.decision() {
             Some(Decision::Allow) => Ok(entities
                 .iter()
-                .filter(|entity| entity.0.uid().entity_type() == &request.0 .0.get_resource_type())
-                .map(super::Entity::uid)
+                .filter(|entity| entity.0.uid().entity_type() == request.0.0.resource_type())
+                .map(Entity::uid)
                 .collect_vec()
                 .into_iter()),
             Some(Decision::Deny) => Ok(vec![].into_iter()),
             None => Ok(entities
                 .iter()
-                .filter(|entity| entity.0.uid().entity_type() == &request.0 .0.get_resource_type())
+                .filter(|entity| entity.0.uid().entity_type() == request.0.0.resource_type())
                 .filter(|entity| {
+                    #[expect(
+                        clippy::unwrap_used, reason = "`to_request` cannot panic because we do not pass a schema. However, the correctness of the authorization
+                        decision depends on having valid a request and entities, but we do not do any validation here. Entities were already validated by
+                        `PartialEntities::from_concrete`. The request was _mostly_ validated by its constructor, but the concrete request could still be invalid
+                        if the resource entity is an enum entity and the id is not an instance of that enum. This cannot happen here because we draw candidate
+                        resources from the entities, which we know are valid."
+                    )]
+                    let req = request.to_request(entity.uid().id().clone(), None).unwrap();
                     let authorizer = Authorizer::new();
-                    authorizer
+                    let auth_response = authorizer
                         .is_authorized(
-                            &request.to_request(entity.uid().id().clone(), None).unwrap(),
-                            policies,
+                            &req,
+                            &policies,
                             entities,
-                        )
-                        .decision
-                        == Decision::Allow
+                        );
+                    auth_response.decision() == Decision::Allow
                 })
-                .map(super::Entity::uid)
+                .map(Entity::uid)
                 .collect_vec()
                 .into_iter()),
         }
@@ -744,45 +824,38 @@ impl PolicySet {
         schema: &Schema,
     ) -> Result<impl Iterator<Item = EntityUid>, PermissionQueryError> {
         let partial_entities = PartialEntities::from_concrete(entities.clone(), schema)?;
-        let residuals = self.tpe(&request.0, &partial_entities, schema)?;
-        #[expect(
-            clippy::unwrap_used,
-            reason = "policy set construction should succeed because there shouldn't be any policy id conflicts"
-        )]
-        let policies = &Self::from_policies(
-            residuals
-                .0
-                .residual_policies()
-                .map(|p| Policy::from_ast(p.clone().into())),
-        )
-        .unwrap();
-        #[expect(
-            clippy::unwrap_used,
-            reason = "request construction should succeed because each entity passes validation"
-        )]
-        match residuals.decision() {
+        let tpe_response = self.tpe(&request.0, &partial_entities, schema)?;
+        let policies = tpe_response.policy_set();
+        match tpe_response.decision() {
             Some(Decision::Allow) => Ok(entities
                 .iter()
-                .filter(|entity| entity.0.uid().entity_type() == &request.0 .0.get_principal_type())
-                .map(super::Entity::uid)
+                .filter(|entity| entity.0.uid().entity_type() == request.0.0.principal_type())
+                .map(Entity::uid)
                 .collect_vec()
                 .into_iter()),
             Some(Decision::Deny) => Ok(vec![].into_iter()),
             None => Ok(entities
                 .iter()
-                .filter(|entity| entity.0.uid().entity_type() == &request.0 .0.get_principal_type())
+                .filter(|entity| entity.0.uid().entity_type() == request.0.0.principal_type())
                 .filter(|entity| {
+                    #[expect(
+                        clippy::unwrap_used, reason = "`to_request` cannot panic because we do not pass a schema. However, the correctness of the authorization
+                        decision depends on having valid a request and entities, but we do not do any validation here. Entities were already validated by
+                        `PartialEntities::from_concrete`. The request was _mostly_ validated by its constructor, but the concrete request could still be invalid
+                        if the principal entity is an enum entity and the id is not an instance of that enum. This cannot happen here because we draw candidate
+                        principals from the entities, which we know are valid."
+                    )]
+                    let req = request.to_request(entity.uid().id().clone(), None).unwrap();
                     let authorizer = Authorizer::new();
-                    authorizer
+                    let auth_response = authorizer
                         .is_authorized(
-                            &request.to_request(entity.uid().id().clone(), None).unwrap(),
-                            policies,
+                            &req,
+                            &policies,
                             entities,
-                        )
-                        .decision
-                        == Decision::Allow
+                        );
+                    auth_response.decision() == Decision::Allow
                 })
-                .map(super::Entity::uid)
+                .map(Entity::uid)
                 .collect_vec()
                 .into_iter()),
         }
@@ -1369,10 +1442,7 @@ unless
                 .tpe(&request, &partial_entities, &schema)
                 .expect("tpe should succeed");
 
-            assert_eq!(
-                response.residual_policies().count(),
-                policies.num_of_policies()
-            );
+            assert_eq!(response.policies().count(), policies.num_of_policies());
             for p in response.residual_policies() {
                 assert_matches!(p.action_constraint(), ActionConstraint::Any);
                 assert_matches!(p.principal_constraint(), PrincipalConstraint::Any);
@@ -1380,7 +1450,7 @@ unless
             }
             assert_eq!(
                 response
-                    .nontrivial_residual_policies()
+                    .residual_policies()
                     .next()
                     .unwrap()
                     .annotation("id")
@@ -3012,7 +3082,7 @@ when { principal in resource.admins };
             .tpe(&request, &partial_entities, &schema)
             .expect("tpe should succeed");
         // There should be exactly one nontrivial residual
-        let residual_policies: Vec<_> = response.nontrivial_residual_policies().collect();
+        let residual_policies: Vec<_> = response.residual_policies().collect();
         assert_eq!(
             residual_policies.len(),
             1,
@@ -3191,7 +3261,7 @@ when { principal in resource.admins };
             .to_pst()
             .unwrap();
 
-            let residuals: Vec<_> = response.nontrivial_residual_policies().collect();
+            let residuals: Vec<_> = response.residual_policies().collect();
             assert_eq!(residuals[0].to_pst().unwrap().body(), expected.body());
             assert_eq!(response.decision(), None);
             assert!(response.reason().is_none());

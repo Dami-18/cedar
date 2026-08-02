@@ -39,15 +39,24 @@ jobs:
 
             # Check that the cargo workspace's version matches the input tag.
             - name: Checkout tag
-              uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
               with:
                   ref: refs/tags/${{ inputs.tag }}
-            - name: Configure rust toolchain
-              run: rustup update stable && rustup default stable
-            - name: Install toml-cli
-              run: cargo install toml-cli --locked
+            # Main is checked out into a subdirectory so the latest scripts
+            # are available.  sparse-checkout ensures no Cargo.toml from main is
+            # present, so a bug in the script can't accidentally validate main's
+            # version.
+            - name: Checkout main (for scripts)
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  sparse-checkout: .github/scripts
+                  path: __main
+            - name: Set up Python
+              uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+              with:
+                  python-version: ">=3.11" # needs tomllib, in stdlib from 3.11
             - name: Validate workspace version
-              run: test "v$(toml get --raw Cargo.toml workspace.package.version)" = "$TAG_NAME"
+              run: python3 __main/.github/scripts/check-crate-version.py cedar-wasm "${TAG_NAME#v}"
               env:
                   TAG_NAME: ${{ inputs.tag }}
 
@@ -58,7 +67,7 @@ jobs:
             npm_tag: ${{ steps.compute_npm_tag.outputs.npm_tag }}
         steps:
             - name: Set up Node.js
-              uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+              uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
               with:
                   node-version: "latest"
                   registry-url: "https://registry.npmjs.org"
@@ -66,13 +75,15 @@ jobs:
             - name: Compute release branch.
               id: compute_release_branch
               uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+              env:
+                  TAG: ${{ inputs.tag }}
               with:
                   script: |
-                      const tag = '${{ inputs.tag }}';
+                      const tag = process.env.TAG;
                       const version = tag.replace('v', '');
                       const [major, minor, _] = version.split('.');
                       const releaseBranch = `release/${major}.${minor}.x`;
-                      core.setOutput('branch_name', releaseBranch);
+                      core.setOutput('release_branch', releaseBranch);
 
             # Compute the tag that should be used for the NPM release by comparing the latest NPM release's
             # version against the version to be released by this workflow.
@@ -84,13 +95,16 @@ jobs:
             - name: Compute NPM tag
               id: compute_npm_tag
               uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+              env:
+                  TAG: ${{ inputs.tag }}
+                  LATEST_NPM_VERSION: ${{ steps.latest_npm_version.outputs.latest_npm_version }}
               with:
                   script: |
                       const compareVersions = require('compare-versions');
-                      const tag = '${{ inputs.tag }}';
+                      const tag = process.env.TAG;
                       const version = tag.replace('v', '');
                       const [major, minor, _] = version.split('.');
-                      const latestRelease = '${{ steps.latest_npm_version.outputs.latest_npm_version }}'
+                      const latestRelease = process.env.LATEST_NPM_VERSION;
                       console.log(`Latest version found on NPM: ${latestRelease}`);
                       let npmTag;
                       if (compareVersions.compare(version, latestRelease, '<=')) {
@@ -117,13 +131,13 @@ jobs:
             id-token: write # Required for OIDC token exchange
         steps:
             - name: Checkout tag
-              uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
               with:
                   ref: refs/tags/${{ inputs.tag }}
             - name: Configure rust toolchain
               run: rustup update stable && rustup default stable
             - name: Set up Node.js
-              uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+              uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
               with:
                   node-version: "latest"
                   registry-url: "https://registry.npmjs.org"

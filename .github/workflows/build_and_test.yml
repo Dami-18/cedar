@@ -34,7 +34,7 @@ jobs:
       RUSTFLAGS: "-D warnings -F unsafe-code -A unfulfilled_lint_expectations" # deny rustc warnings, except allow on unfulfilled_lint_expectations. note that none of this line affects _clippy_ warnings, only _rustc_ warnings
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: sudo apt-get update && sudo apt-get install protobuf-compiler
       - run: rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
       - run: cargo install cargo-audit --locked
@@ -66,13 +66,13 @@ jobs:
         shell: bash
         run: df -h
       - name: Set environment variables for coverage collection
-        if: ${{ inputs.collect_coverage }} && ${{ matrix.toolchain }} == 'stable'
+        if: ${{ inputs.collect_coverage && matrix.toolchain == 'stable' }}
         shell: bash
         run: |
           echo "RUSTFLAGS=-C instrument-coverage" >> $GITHUB_ENV
           echo "LLVM_PROFILE_FILE=cedar_%m_%p.profraw" >> $GITHUB_ENV
 
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: sudo apt-get update && sudo apt-get install protobuf-compiler
       - run: rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
 
@@ -100,7 +100,7 @@ jobs:
       - run: cargo test --verbose --features "experimental,unstable-tooling"
       - run: cargo test --verbose -p cedar-policy-cli --all-features # Specifically run cedar-policy-cli tests with --all-features
       - name: Create a coverage report
-        if: ${{ inputs.collect_coverage }} && ${{ matrix.toolchain }} == 'stable'
+        if: ${{ inputs.collect_coverage && matrix.toolchain == 'stable' }}
         uses: ./.github/actions/create_coverage_reports
         with:
           retention-days: ${{ inputs.retention-days }}
@@ -116,7 +116,7 @@ jobs:
           - stable
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: sudo apt-get update && sudo apt-get install protobuf-compiler
       - run: rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
       - run: rustup component add clippy
@@ -133,7 +133,7 @@ jobs:
           - stable
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
       - run: rustup component add rustfmt
       - run: cargo fmt --all --check
@@ -142,14 +142,14 @@ jobs:
     name: cargo deny
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
 
   # See https://doc.rust-lang.org/cargo/guide/continuous-integration.html#verifying-rust-version
   msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: taiki-e/install-action@fe18b65ff0d7a76aced2f43aeace5de8f236b1f7 # cargo-hack
       - run: sudo apt-get update && sudo apt-get install protobuf-compiler
       - run: cargo hack check --rust-version --workspace --all-targets --ignore-private --all-features
@@ -165,7 +165,7 @@ jobs:
       RUSTFLAGS: "-D warnings -F unsafe-code"
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: update llvm (macOS)
         if: ${{ matrix.os  == 'macos-15-intel' }}
         run: brew install llvm && echo "/usr/local/opt/llvm/bin" >> $GITHUB_PATH

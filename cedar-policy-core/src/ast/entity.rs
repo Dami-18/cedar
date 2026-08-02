@@ -31,7 +31,7 @@ use itertools::Itertools;
 use miette::Diagnostic;
 use serde::{de::Deserializer, ser::Serializer, Deserialize, Serialize};
 use smol_str::SmolStr;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use thiserror::Error;
@@ -229,8 +229,7 @@ impl EntityUIDImpl {
 }
 
 /// Unique ID for an entity. These represent entities in the AST.
-#[derive(Educe, Debug, Clone)]
-#[educe(PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum EntityUID {
     /// Unique ID for an entity. These represent entities in the AST
     EntityUID(EntityUIDImpl),
@@ -722,17 +721,17 @@ impl Entity {
         self,
     ) -> (
         EntityUID,
-        HashMap<SmolStr, PartialValue>,
+        BTreeMap<SmolStr, PartialValue>,
         HashSet<EntityUID>,
         HashSet<EntityUID>,
-        HashMap<SmolStr, PartialValue>,
+        BTreeMap<SmolStr, PartialValue>,
     ) {
         (
             self.uid,
-            self.attrs.into_iter().collect(),
+            self.attrs,
             self.indirect_ancestors,
             self.parents,
-            self.tags.into_iter().collect(),
+            self.tags,
         )
     }
 
@@ -762,6 +761,9 @@ impl Entity {
     /// - entity should not be its own ancestor
     /// - parents and indirect_ancestors should be disjoint
     /// - action entities must only have action parents
+    ///
+    /// The [`uid`], [`attrs`] and [`tags`] are correct by construction (valid names where
+    /// applicable).
     pub fn try_validate(self) -> Result<Self, EntitiesError> {
         self.validate()?;
         Ok(self)
@@ -1015,6 +1017,17 @@ mod test {
         let serialized = serde_json::to_string(&entity_type).unwrap();
 
         assert_eq!(serialized, r#""some_entity_type""#);
+    }
+
+    #[test]
+    fn euid_ordering_matches_type_then_eid() {
+        let euid1 = EntityUID::from_str("AA::\"zzz\"").unwrap();
+        let euid2 = EntityUID::from_str("B::\"aaa\"").unwrap();
+        // The type is the primary sort key: `AA` < `B` regardless of eid.
+        assert!(euid1 < euid2);
+        let euid3 = EntityUID::from_str("AA::\"aaa\"").unwrap();
+        // The eid is the tie-breaker when the types are equal.
+        assert!(euid3 < euid1);
     }
 }
 
