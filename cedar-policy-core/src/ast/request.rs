@@ -723,6 +723,7 @@ impl IsInfallible for std::convert::Infallible {
 }
 
 impl IsInfallible for Infallible {
+    #[allow(unreachable_code)]
     fn never_returns(self) -> std::convert::Infallible {
         self.0.never_returns()
     }

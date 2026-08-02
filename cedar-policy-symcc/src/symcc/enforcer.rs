@@ -77,10 +77,7 @@ fn of_branch<'a>(
 // redundant by itself, and also potentially redundant with other `compile()`
 // calls in verifier.rs. For a much more optimized version, use functionality
 // in the `symccopt` module.
-#[expect(
-    unreachable_patterns,
-    reason = "pattern may or may not be unreachable depending on whether `tolerant-ast` feature of cedar-policy-core is enabled"
-)]
+#[allow(unreachable_patterns)]
 pub(crate) fn footprint<'a>(x: &'a Expr, env: &'a SymEnv) -> Box<dyn Iterator<Item = Term> + 'a> {
     let of_entity = |x: &Expr| -> Box<dyn Iterator<Item = Term>> {
         match compile(x, env) {
