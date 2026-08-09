@@ -27,6 +27,29 @@ use std::sync::Arc;
 const SCOPE_PRINCIPAL_ATTR: &str = "__scope_principal";
 const SCOPE_RESOURCE_ATTR: &str = "__scope_resource";
 const SCOPE_ACTION_ATTR: &str = "__scope_action";
+// Namespace prefix for context attributes, so `context.foo` never collides
+// with a principal/resource attribute also named `foo` in the flat attr map.
+const CONTEXT_ATTR_PREFIX: &str = "__context_";
+
+fn context_attr_key(attr: &SmolStr) -> SmolStr {
+    format!("{CONTEXT_ATTR_PREFIX}{attr}").into()
+}
+
+fn is_context_attr(attr: &SmolStr) -> bool {
+    attr.as_str().starts_with(CONTEXT_ATTR_PREFIX)
+}
+
+/// Look up a literal value for a context attribute directly from the
+/// request's `Context` record. Context is per-request, not a property of
+/// any entity, so (unlike principal/resource attributes) this never scans
+/// the `Entities` store.
+fn request_context_literal(request: &Request, attr: &SmolStr) -> Option<Literal> {
+    let raw_attr = attr.as_str().strip_prefix(CONTEXT_ATTR_PREFIX)?;
+    match request.context()? {
+        Context::Value(map) => map.get(raw_attr).and_then(|v| v.try_as_lit().cloned()),
+        Context::RestrictedResidual(_) => None,
+    }
+}
 
 // Non-scope (`when`-clause) constraints are indexed per-attribute-NAME, e.g.
 // "clearance". If a policy constrains `principal.clearance` and
@@ -149,12 +172,17 @@ fn request_values_for_attr(request: &Request, entities: &Entities, attr: &SmolSt
         return scope_literals;
     }
 
-    // Every non-scope constraint this tree can act on was registered under a
-    // side-scoped key (see `side_scoped_attr`), so only look up the ONE
-    // entity the key actually refers to -- never both. A key that isn't
-    // side-scoped never has a matching pv_map entry (see `build_from_entities`)
-    // and so is never chosen as a split attribute; this path only exists as a
-    // safe default if that invariant is ever violated.
+    if is_context_attr(attr) {
+        return request_context_literal(request, attr).into_iter().collect();
+    }
+
+    // Every non-scope, non-context constraint this tree can act on was
+    // registered under a side-scoped key (see `side_scoped_attr`), so only
+    // look up the ONE entity the key actually refers to -- never both. A key
+    // that isn't side-scoped never has a matching pv_map entry (see
+    // `build_from_entities`) and so is never chosen as a split attribute;
+    // this path only exists as a safe default if that invariant is ever
+    // violated.
     let Some((is_principal, raw_attr)) = split_side_scoped_attr(attr.as_str()) else {
         return Vec::new();
     };
@@ -254,6 +282,9 @@ fn collect_attr_constraints(expr: &Expr, constraints: &mut Vec<(SmolStr, Literal
             _ => None,
         }
     }
+    fn is_context_var(base: &Expr) -> bool {
+        matches!(base.expr_kind(), ExprKind::Var(Var::Context))
+    }
 
     match expr.expr_kind() {
         ExprKind::And { left, right } => {
@@ -270,20 +301,26 @@ fn collect_attr_constraints(expr: &Expr, constraints: &mut Vec<(SmolStr, Literal
                 (
                     ExprKind::GetAttr { expr: base, attr }, // rename to base to avoid conflict with function argument
                     ExprKind::Lit(lit),
-                ) => match side_of(base) {
-                    Some(is_principal) => {
+                ) => {
+                    if let Some(is_principal) = side_of(base) {
                         constraints.push((side_scoped_attr(is_principal, attr), lit.clone()));
                         true
+                    } else if is_context_var(base) {
+                        constraints.push((context_attr_key(attr), lit.clone()));
+                        true
+                    } else {
+                        false
                     }
-                    None => false,
-                },
+                }
                 (ExprKind::Lit(lit), ExprKind::GetAttr { expr: base, attr }) => {
-                    match side_of(base) {
-                        Some(is_principal) => {
-                            constraints.push((side_scoped_attr(is_principal, attr), lit.clone()));
-                            true
-                        }
-                        None => false,
+                    if let Some(is_principal) = side_of(base) {
+                        constraints.push((side_scoped_attr(is_principal, attr), lit.clone()));
+                        true
+                    } else if is_context_var(base) {
+                        constraints.push((context_attr_key(attr), lit.clone()));
+                        true
+                    } else {
+                        false
                     }
                 }
                 _ => false,
@@ -635,9 +672,10 @@ impl PolTreeIndex {
     /// expression and matching the extracted attribute constraints against the
     /// entity store, so callers do not need to supply those maps manually.
     ///
-    /// Only flat equality constraints of the form
-    /// `resource.attr == <literal>` (or `principal.attr == <literal>`) are
-    /// recognised; more complex conditions are ignored (safe under-approximation).
+    /// Only flat equality constraints of the form `resource.attr == <literal>`,
+    /// `principal.attr == <literal>`, or `context.attr == <literal>` (in either
+    /// operand order) are recognised; more complex conditions — including
+    /// attribute-to-attribute comparisons — are ignored (safe under-approximation).
     ///
     /// Policies whose scope or non-scope condition could not be FULLY captured
     /// as flat equality constraints -- and any `forbid`-effect policy, since
@@ -702,14 +740,25 @@ impl PolTreeIndex {
             }
 
             constraints.extend(non_scope_constraints.into_iter().map(|(attr, lit)| {
-                // `attr` is the side-scoped index key (see `side_scoped_attr`);
-                // `entities_with_attr_literal` needs the underlying entity
-                // attribute name to actually find matching entities.
-                let raw_attr = split_side_scoped_attr(attr.as_str())
-                    .map(|(_, raw)| SmolStr::from(raw))
-                    .unwrap_or_else(|| attr.clone());
+                // `attr` is either a side-scoped index key (see `side_scoped_attr`)
+                // for principal/resource attributes, or a context-namespaced key
+                // (see `context_attr_key`) for context attributes. Context isn't a
+                // property of any entity, so there's nothing to scan the Entities
+                // store for; candidates is left empty and such constraints are
+                // excluded from the coverage intersection below instead.
+                let candidates = if is_context_attr(&attr) {
+                    HashSet::new()
+                } else {
+                    // `attr` is the side-scoped index key (see `side_scoped_attr`);
+                    // `entities_with_attr_literal` needs the underlying entity
+                    // attribute name to actually find matching entities.
+                    let raw_attr = split_side_scoped_attr(attr.as_str())
+                        .map(|(_, raw)| SmolStr::from(raw))
+                        .unwrap_or_else(|| attr.clone());
+                    entities_with_attr_literal(entities.as_ref(), &raw_attr, &lit)
+                };
                 Constraint {
-                    candidates: entities_with_attr_literal(entities.as_ref(), &raw_attr, &lit),
+                    candidates,
                     attr,
                     values: vec![lit],
                 }
@@ -739,6 +788,12 @@ impl PolTreeIndex {
             // Start with the candidates for the first constraint, then intersect with candidates for each subsequent constraint.
             let mut covered: Option<HashSet<EntityUID>> = None;
             for constraint in &constraints {
+                // Context conditions don't narrow which entities a policy
+                // covers, so they're excluded from the intersection: only
+                // principal/resource (and scope) constraints affect Sv.
+                if is_context_attr(&constraint.attr) {
+                    continue;
+                }
                 covered = Some(match covered.take() {
                     None => constraint.candidates.clone(),
                     Some(existing) => existing
