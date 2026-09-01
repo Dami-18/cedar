@@ -968,7 +968,7 @@ impl<T: Clone> std::fmt::Display for Expr<T> {
         // To avoid code duplication between pretty-printers for AST Expr and EST Expr,
         // we just convert to EST and use the EST pretty-printer.
         // Note that converting AST->EST is lossless and infallible.
-        write!(f, "{}", &self.clone().into_expr::<crate::est::Builder>())
+        write!(f, "{}", self.clone().into_expr::<crate::est::Builder>())
     }
 }
 
@@ -1933,8 +1933,6 @@ mod test {
     use itertools::Itertools;
     use smol_str::ToSmolStr;
     use std::collections::{hash_map::DefaultHasher, HashSet};
-
-    use crate::expr_builder::ExprBuilder as _;
 
     use super::*;
 
