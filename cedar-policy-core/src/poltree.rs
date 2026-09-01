@@ -96,37 +96,87 @@ struct Constraint {
     candidates: HashSet<EntityUID>,
 }
 
-fn entities_with_attr_literal(
-    entities: &Entities,
+/// O(1) direct lookup for whether a specific entity UID exists in the store,
+/// used for `principal == X` / `resource == X` / `action == Y` scope
+/// constraints. `Entities::entity` is backed by a hash map keyed on
+/// `EntityUID`, so this never needs to scan the store.
+fn entities_with_uid(entities: &Entities, uid: &EntityUID) -> HashSet<EntityUID> {
+    match entities.entity(uid) {
+        Dereference::Data(_) => HashSet::from([uid.clone()]),
+        _ => HashSet::new(),
+    }
+}
+
+/// Precomputed, one-time-scan indexes over the entity store, built once and
+/// reused across every constraint of every policy while building a
+/// `PolTreeIndex`. Without this, resolving each policy's attribute-value and
+/// `is <Type>` scope constraints would otherwise re-scan the *entire* entity
+/// store once per constraint, making total build cost O(constraints *
+/// entities) instead of the O(entities * attrs_per_entity) a single pass
+/// actually requires -- for a policy set of any real size (many policies,
+/// each with several attribute constraints) this dominates build time.
+struct EntityScanIndexes {
+    attr_values: HashMap<SmolStr, HashSet<Literal>>,
+    sv_map: HashMap<(SmolStr, Literal), Vec<EntityUID>>,
+    type_index: HashMap<EntityType, HashSet<EntityUID>>,
+}
+
+fn scan_entities(entities: &Entities) -> EntityScanIndexes {
+    let mut attr_values: HashMap<SmolStr, HashSet<Literal>> = HashMap::new();
+    let mut sv_map: HashMap<(SmolStr, Literal), Vec<EntityUID>> = HashMap::new();
+    let mut type_index: HashMap<EntityType, HashSet<EntityUID>> = HashMap::new();
+
+    for entity in entities.iter() {
+        let uid = entity.uid().clone();
+        type_index
+            .entry(uid.entity_type().clone())
+            .or_default()
+            .insert(uid.clone());
+        for (attr, pval) in entity.attrs() {
+            // Only index scalar (Literal) values; skip sets, records, residuals
+            if let PartialValue::Value(v) = pval {
+                if let Some(lit) = v.try_as_lit() {
+                    let lit = lit.clone();
+                    attr_values
+                        .entry(attr.clone())
+                        .or_default()
+                        .insert(lit.clone());
+                    sv_map
+                        .entry((attr.clone(), lit))
+                        .or_default()
+                        .push(uid.clone());
+                }
+            }
+        }
+    }
+
+    EntityScanIndexes {
+        attr_values,
+        sv_map,
+        type_index,
+    }
+}
+
+/// O(1) (after `scan_entities` has run once) replacement for scanning the
+/// whole entity store to find entities with a given attribute value.
+fn candidates_from_sv_map(
+    sv_map: &HashMap<(SmolStr, Literal), Vec<EntityUID>>,
     attr: &SmolStr,
     lit: &Literal,
 ) -> HashSet<EntityUID> {
-    entities
-        .iter()
-        .filter(|e| {
-            e.get(attr).and_then(|pv| match pv {
-                PartialValue::Value(v) => v.try_as_lit(),
-                _ => None,
-            }) == Some(lit)
-        })
-        .map(|e| e.uid().clone())
-        .collect()
+    sv_map
+        .get(&(attr.clone(), lit.clone()))
+        .map(|v| v.iter().cloned().collect())
+        .unwrap_or_default()
 }
 
-fn entities_with_uid(entities: &Entities, uid: &EntityUID) -> HashSet<EntityUID> {
-    entities
-        .iter()
-        .filter(|e| e.uid() == uid)
-        .map(|e| e.uid().clone())
-        .collect()
-}
-
-fn entities_with_type(entities: &Entities, entity_type: &EntityType) -> HashSet<EntityUID> {
-    entities
-        .iter()
-        .filter(|e| e.uid().entity_type() == entity_type)
-        .map(|e| e.uid().clone())
-        .collect()
+/// O(1) (after `scan_entities` has run once) replacement for scanning the
+/// whole entity store to find every entity of a given type.
+fn candidates_from_type_index(
+    type_index: &HashMap<EntityType, HashSet<EntityUID>>,
+    entity_type: &EntityType,
+) -> HashSet<EntityUID> {
+    type_index.get(entity_type).cloned().unwrap_or_default()
 }
 
 // Scope attributes (__scope_principal / __scope_resource) are indexed under two
@@ -219,6 +269,7 @@ fn request_values_for_attr(request: &Request, entities: &Entities, attr: &SmolSt
 // which is only sound for constraints we actually understood.
 fn principal_or_resource_scope_constraints(
     entities: &Entities,
+    type_index: &HashMap<EntityType, HashSet<EntityUID>>,
     attr_name: &str,
     constraint: &PrincipalOrResourceConstraint,
 ) -> (Vec<Constraint>, bool) {
@@ -237,7 +288,7 @@ fn principal_or_resource_scope_constraints(
             vec![Constraint {
                 attr,
                 values: vec![Literal::String(entity_type.to_smolstr())],
-                candidates: entities_with_type(entities, entity_type),
+                candidates: candidates_from_type_index(type_index, entity_type),
             }],
             true,
         ),
@@ -344,13 +395,20 @@ pub fn policy_is_fully_indexed(policy: &Policy, entities: &Entities) -> bool {
     if policy.effect() == Effect::Forbid {
         return false;
     }
+    // The `Is` branch's `ok` is a constant `true` regardless of what
+    // candidates end up in the discarded constraint list below, so an empty
+    // type index is fine here -- this function only cares about the
+    // fully-indexed boolean, never the actual candidate entity sets.
+    let empty_type_index = HashMap::new();
     let (_, ok1) = principal_or_resource_scope_constraints(
         entities,
+        &empty_type_index,
         SCOPE_PRINCIPAL_ATTR,
         policy.template().principal_constraint().as_inner(),
     );
     let (_, ok2) = principal_or_resource_scope_constraints(
         entities,
+        &empty_type_index,
         SCOPE_RESOURCE_ATTR,
         policy.template().resource_constraint().as_inner(),
     );
@@ -689,6 +747,15 @@ impl PolTreeIndex {
         policy_set: &PolicySet,
         entities: Arc<Entities>,
     ) -> (Self, Vec<PolicyID>) {
+        // One single pass over the entity store, reused for every constraint
+        // of every policy below -- see `scan_entities`'s doc comment for why
+        // this matters.
+        let EntityScanIndexes {
+            mut attr_values,
+            sv_map,
+            type_index,
+        } = scan_entities(entities.as_ref());
+
         let mut pv_map: HashMap<(SmolStr, Literal), Vec<PolicyID>> = HashMap::new();
         let mut policy_entities_map: HashMap<PolicyID, Vec<EntityUID>> = HashMap::new();
         let mut residual: Vec<PolicyID> = Vec::new();
@@ -706,6 +773,7 @@ impl PolTreeIndex {
 
             let (c, ok) = principal_or_resource_scope_constraints(
                 entities.as_ref(),
+                &type_index,
                 SCOPE_PRINCIPAL_ATTR,
                 policy.template().principal_constraint().as_inner(),
             );
@@ -714,6 +782,7 @@ impl PolTreeIndex {
 
             let (c, ok) = principal_or_resource_scope_constraints(
                 entities.as_ref(),
+                &type_index,
                 SCOPE_RESOURCE_ATTR,
                 policy.template().resource_constraint().as_inner(),
             );
@@ -743,19 +812,20 @@ impl PolTreeIndex {
                 // `attr` is either a side-scoped index key (see `side_scoped_attr`)
                 // for principal/resource attributes, or a context-namespaced key
                 // (see `context_attr_key`) for context attributes. Context isn't a
-                // property of any entity, so there's nothing to scan the Entities
-                // store for; candidates is left empty and such constraints are
-                // excluded from the coverage intersection below instead.
+                // property of any entity, so there's nothing to look up in the
+                // entity-derived indexes; candidates is left empty and such
+                // constraints are excluded from the coverage intersection below
+                // instead.
                 let candidates = if is_context_attr(&attr) {
                     HashSet::new()
                 } else {
                     // `attr` is the side-scoped index key (see `side_scoped_attr`);
-                    // `entities_with_attr_literal` needs the underlying entity
+                    // `candidates_from_sv_map` needs the underlying entity
                     // attribute name to actually find matching entities.
                     let raw_attr = split_side_scoped_attr(attr.as_str())
                         .map(|(_, raw)| SmolStr::from(raw))
                         .unwrap_or_else(|| attr.clone());
-                    entities_with_attr_literal(entities.as_ref(), &raw_attr, &lit)
+                    candidates_from_sv_map(&sv_map, &raw_attr, &lit)
                 };
                 Constraint {
                     candidates,
@@ -807,8 +877,27 @@ impl PolTreeIndex {
             }
         }
 
+        // `attr_values` from `scan_entities` already covers every value that
+        // actually appears on some entity; merge in any additional values
+        // referenced only by policy constraints (e.g. a scope `is <Type>`
+        // string, or a `principal == X` EntityUID literal, neither of which
+        // necessarily also appears as a literal attribute value on some
+        // entity).
+        for (attr, val) in pv_map.keys() {
+            attr_values
+                .entry(attr.clone())
+                .or_default()
+                .insert(val.clone());
+        }
+
         (
-            Self::build_from_entities(entities, pv_map, policy_entities_map),
+            Self {
+                entities,
+                attr_values,
+                pv_map,
+                sv_map,
+                policy_entities_map,
+            },
             residual,
         )
     }
